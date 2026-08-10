@@ -13,8 +13,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-import pd_plots
-from climacred_loader import load_pd, resolve_region
+from pd import pd_plots
+from pd.climacred_loader import load_pd, resolve_region
 
 BASE_DIR = Path(__file__).resolve().parent
 FIGS_DIR = BASE_DIR / "Figs"

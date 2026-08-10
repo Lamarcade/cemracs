@@ -1,0 +1,73 @@
+# Bucket mapping artefact -- NGFS/CLIMACRED sector -> carbon bucket, with the NACE
+# codes each sector is meant to cover on the bank side.
+#
+# This file is deliberately NOT Python. It is the most contestable assumption in the
+# whole chain: NGFS PD projections arrive as (scenario, sector, region, date) while a
+# bank book arrives as (NACE code, country, rating), and every result downstream
+# inherits whatever is decided here. Keep it showable and editable without touching
+# the code (specification section 7.6).
+#
+# carbon_bucket rule currently applied, at the level of sector_group:
+#     H  <-  "Energie fossile", "Electricite fossile", "Industrie lourde"
+#     L  <-  everything else
+# sector_group values are byte-identical to climacred_loader.SECTOR_GROUPS, and
+# scenarios.check_mapping_coverage() enforces that.
+#
+# First candidates for reclassification, flagged rather than silently applied:
+# "Air transport" and "Water transport" are carbon-intensive on any emissions
+# measure but land in L under the group-level rule above. Reclassify them here, not
+# in the code, and re-run to see how much the scenario ranking moves.
+#
+# Aggregation to H/L is exposure-weighted (scenarios.aggregate_to_carbon_buckets).
+# nace_codes are indicative section/division prefixes, ';'-separated.
+ngfs_sector,sector_group,carbon_bucket,nace_codes
+Coal,Énergie fossile,H,B05
+Crude Oil,Énergie fossile,H,B06.1
+Oil,Énergie fossile,H,C19.2
+Gas,Énergie fossile,H,B06.2;D35.2
+Coal fired,Électricité fossile,H,D35.11
+Gas Fired,Électricité fossile,H,D35.11
+Oil Fired,Électricité fossile,H,D35.11
+CCS coal,Électricité fossile,H,D35.11
+CSS Gas,Électricité fossile,H,D35.11
+Nuclear,Électricité bas-carbone,L,D35.11
+Hydro electric,Électricité bas-carbone,L,D35.11
+Wind,Électricité bas-carbone,L,D35.11
+PV,Électricité bas-carbone,L,D35.11
+Geothermal,Électricité bas-carbone,L,D35.11
+Biomass Solid,Électricité bas-carbone,L,D35.11
+CSS Bio,Électricité bas-carbone,L,D35.11
+Power Supply,Réseau électrique,L,D35.12;D35.13
+Hydrogen,Vecteurs & captage,L,C20.11
+Clean Gas,Vecteurs & captage,L,D35.2
+Biofuels,Vecteurs & captage,L,C19.2;C20.14
+Biomass,Vecteurs & captage,L,A02
+CO2 Capture,Vecteurs & captage,L,E39
+Batteries,Équipements bas-carbone,L,C27.2
+Equipment for PV panels,Équipements bas-carbone,L,C26.11;C27.9
+Equipment for wind power technology,Équipements bas-carbone,L,C28.11
+Equipment for CCS power technology,Équipements bas-carbone,L,C28.29
+EV Transport Equipment,Équipements bas-carbone,L,C29.1
+Advanced Electric Appliances,Équipements bas-carbone,L,C27.5
+Advanced Heating and Cooking Appliances,Équipements bas-carbone,L,C27.51
+Ferrous metals,Industrie lourde,H,C24.1
+Non-ferrous metals,Industrie lourde,H,C24.4
+Non-metallic minerals,Industrie lourde,H,C23
+Chemical Products,Industrie lourde,H,C20
+"Paper products, publishing",Industrie lourde,H,C17;C18
+Fabricated Metal products,Industrie manufacturière,L,C25
+"Computer, electronic and optical products",Industrie manufacturière,L,C26
+Rubber and plastic products,Industrie manufacturière,L,C22
+Basic pharmaceutical products,Industrie manufacturière,L,C21
+Consumer Goods Industries,Industrie manufacturière,L,C10;C11;C13;C14;C15
+Other Equipment Goods,Industrie manufacturière,L,C28
+Transport equipment (excluding EV),Industrie manufacturière,L,C29;C30
+Construction,Industrie manufacturière,L,F41;F42;F43
+Air transport,Transport & logistique,L,H51
+Land transport,Transport & logistique,L,H49
+Water transport,Transport & logistique,L,H50
+Warehousing,Transport & logistique,L,H52
+Agriculture,Agriculture & services,L,A01
+Market Services,Agriculture & services,L,G;I;J;K;L;M;N
+Non Market Services,Agriculture & services,L,O;P;Q
+R&D,Agriculture & services,L,M72

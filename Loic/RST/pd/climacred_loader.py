@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = Path(__file__).resolve().parents[3]
 XLSX_PATH = BASE_DIR / "Data" / "NGFS_ST" / "CLIMACRED_IIASA_2025_07_02.xlsx"
 CACHE_PATH = BASE_DIR / "Data" / "NGFS_ST" / "_cache" / "CLIMACRED_IIASA_2025_07_02.csv.gz"
 

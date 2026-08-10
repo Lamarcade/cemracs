@@ -16,8 +16,8 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 
-import viz_style as vs
-from climacred_loader import SCENARIO_LABELS, top_sectors
+from . import viz_style as vs
+from .climacred_loader import SCENARIO_LABELS, top_sectors
 
 SCENARIO_ORDER = ["DAPS", "DIRE", "HWTP", "SWUC"]
 
