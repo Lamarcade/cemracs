@@ -194,6 +194,17 @@ def calibrate_cet1_for_ratio(
     -------
     Portfolio
         Copy with an adjusted ``cet1_0``. Exposures and ``rwa_oth`` are untouched.
+
+    Notes
+    -----
+    This is the one place where the choice of reference narrative stops being a pure
+    normalisation. The breach algebra itself is strictly invariant in ``p0``
+    (specification section 3, property 2), but ``cet1_0`` is pinned *against* ``p0``
+    here, so a different ``p0`` yields a different balance sheet and hence a different
+    ``H[n]``. The effect is a **uniform level shift** of every scenario's distance to
+    breach -- the ranking and the gaps between scenarios are untouched -- but the
+    absolute distances are not comparable across runs that used different ``p0``.
+    Calibrate once, then vary ``p0``, rather than the other way round.
     """
     if target_ratio <= cfg.r_star:
         raise ValueError(
@@ -320,6 +331,16 @@ class CriticalPdResult:
         the bucket is too small to break the ratio alone, even at maximum PD.
     zero_exposure : ndarray of bool, same shape
         ``E[g,n] ~ 0``, short-circuited before any inversion is attempted.
+    reach_margin : ndarray, same shape
+        ``E[g,n] * (Psi_g(p_max) - Psi_g(p0[g,n])) - H_tilde[g,n]``, in euros: the
+        capital by which pushing the bucket to the top of the admissible domain
+        overshoots (positive) or falls short of (negative) the residual cushion.
+
+        The one ranking key that stays finite and meaningful in all three limiting
+        cases, which ``critical_pd`` itself does not -- it is ``-inf`` when already
+        breached and ``NaN`` when unreachable, so sorting on it degenerates exactly
+        when the portfolio is granular enough for every bucket to be unreachable.
+        Larger means closer to breaking the ratio alone.
     """
 
     critical_pd: NDArray[np.float64]
@@ -327,6 +348,7 @@ class CriticalPdResult:
     already_breached: NDArray[np.bool_]
     unreachable: NDArray[np.bool_]
     zero_exposure: NDArray[np.bool_]
+    reach_margin: NDArray[np.float64]
 
     @property
     def solved(self) -> NDArray[np.bool_]:
@@ -398,12 +420,16 @@ def critical_pd(
     values = np.where(already_breached, -np.inf, values)
     values = np.where(zero_exposure, np.nan, values)
 
+    reach_margin = exposure * (psi_max - psi_baseline[None, :, :]) - residual
+    reach_margin = np.where(zero_exposure, -np.inf, reach_margin)
+
     return CriticalPdResult(
         critical_pd=values,
         residual_cushion=residual,
         already_breached=already_breached,
         unreachable=unreachable,
         zero_exposure=zero_exposure,
+        reach_margin=reach_margin,
     )
 
 

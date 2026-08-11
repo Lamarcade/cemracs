@@ -284,7 +284,7 @@ def stylised_portfolio(
 def stylised_hl_portfolio(
     dates: NDArray[np.int64] | list[int],
     corporate_book: float = 300e9,
-    high_carbon_share: float = 0.20,
+    high_carbon_share: float = 0.60,
     cet1_0: float = 45e9,
     rwa_oth: float = 60e9,
 ) -> Portfolio:

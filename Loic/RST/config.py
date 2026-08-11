@@ -102,9 +102,17 @@ class SensitivityParams:
         Which convention ``r_star`` came from. Carried along for labelling only;
         nothing in the maths reads it.
     pd_max : float
-        Upper bound of the admissible PD domain. 0.30 is an *economic credibility*
-        bound, not a mathematical one: the hard bound is :data:`PSI_MONOTONE_MAX`,
-        so there is a factor ~2.4 of headroom.
+        Upper bound of the admissible PD domain, an *economic credibility* bound
+        rather than a mathematical one: the hard bound is :data:`PSI_MONOTONE_MAX`.
+
+        The specification proposes 0.30; the default here is **0.50**, because on the
+        CLIMACRED file 0.30 censors about 19% of the cube against 2.4% at 0.50, and
+        that censoring saturates the erosion-based sector ranking (four sectors tie at
+        the full domain span). 0.50 keeps a factor 1.44 of headroom to the hard bound
+        and still sits where ``Psi`` has slope: ``Psi'(0.50) = 0.147`` against
+        ``Psi'(0.70) = 0.011``, so going higher buys resolution the model does not
+        have -- ``Psi`` is within 3.7% of its own maximum by 0.70, and ``K`` is
+        *decreasing* there, well outside the regime the IRB formula describes.
     baseline_scenario : str or None
         Reference narrative ``s_0`` defining ``p0[g,n]``. Mathematically a pure
         normalisation (the breach set is invariant), but not neutral for
@@ -122,7 +130,7 @@ class SensitivityParams:
 
     r_star: float = 0.105
     r_star_convention: RStarConvention = "absolute"
-    pd_max: float = 0.30
+    pd_max: float = 0.50
     baseline_scenario: str | None = None
     phi: float = 1.0
     kappa_tax: float = 0.0
@@ -192,6 +200,18 @@ class RstConfig:
                 self.sensitivity, r_star=r_star, r_star_convention=convention
             ),
         )
+
+    def with_pd_max(self, pd_max: float) -> RstConfig:
+        """Copy with a different upper bound on the admissible PD domain.
+
+        A declared sensitivity (specification section 6). Raising it loosens the
+        censoring that clipping imposes on extreme sectors, at the cost of pricing PDs
+        no performing corporate book would plausibly show -- past roughly 0.5 the
+        obligor is in or near default, where CRR3 leaves the ``K`` formula entirely.
+        The default is 0.50; the specification's 0.30 is reached with
+        ``with_pd_max(0.30)``.
+        """
+        return replace(self, sensitivity=replace(self.sensitivity, pd_max=pd_max))
 
     def with_baseline_scenario(self, scenario: str) -> RstConfig:
         """Copy with a different reference narrative ``s_0``.

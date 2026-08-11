@@ -1,10 +1,9 @@
 """Basel IRB capital charge and the combined erosion function ``Psi``.
 
-Pure, stateless, vectorised functions. This layer knows nothing about portfolios or
-scenarios: it maps default probabilities to capital quantities, nothing else.
+Maps default probabilities to capital quantities.
 
 The model (specification section 2.2), for corporate exposures at the F-IRB default
-maturity ``M = 2.5``::
+maturity ``M = 2.5``:
 
     w(p)  = (1 - exp(-50 p)) / (1 - exp(-50))
     R(p)  = 0.12 w(p) + 0.24 (1 - w(p))          asset correlation, decreasing
@@ -17,14 +16,14 @@ for *unexpected* loss only. That is what guarantees no double counting with the
 provision channel: EL goes to the numerator via IFRS 9 provisions, UL goes to the
 denominator via RWA, and the two partition the same 99.9% conditional loss.
 
-The erosion function combines both channels into one increasing function per bucket::
+The erosion function combines both channels into one increasing function per bucket:
 
     Psi(p) = ell * p  +  12.5 * R_star * K(p)
 
 Monotonicity (specification section 4). ``K`` is **not** monotone: it peaks at
 ``p = 0.2962`` and decreases afterwards. ``Psi`` nevertheless is, on the whole
 admissible domain ``[3e-4, 0.7202]``, because the provision slope ``ell`` absorbs the
-negative slope of the capital charge -- the sufficient condition is
+negative slope of the capital charge. The sufficient condition is
 ``K'(p) > -ell / (12.5 R_star) = -0.3048``. This is what makes the bucket-by-bucket
 inversion of section 8 legitimate.
 

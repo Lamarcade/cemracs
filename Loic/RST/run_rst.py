@@ -31,15 +31,29 @@ from pd.climacred_loader import SCENARIO_LABELS, load_pd, resolve_region
 BASE_DIR = Path(__file__).resolve().parent
 FIGS_DIR = BASE_DIR / "Figs"
 
-# Six regions covered by all four scenarios, and deliberately not EU-only: DIRE and
-# HWTP have *identical* PD projections on 39 of the 53 regions, including every
-# European one. Ranking scenarios on a European-only book would therefore show two
-# of the four as indistinguishable -- a property of the source file, not of the model.
-DEFAULT_REGIONS = ["EU27", "USA - USA", "China - CHN", "India - IND", "Japan - JPN", "Brazil - BRA"]
+# EU27: the home region for the ICAAP reading, and the one aggregate that clears every
+# trap at once. All four narratives cover it, unlike World, which has no DAPS rows. All
+# four stay distinct on it, unlike the elementary European regions (France, Germany,
+# Italy, Spain), where DIRE and HWTP are numerically identical -- EU27 is an aggregate
+# and mixes in countries where they diverge, by up to 3.8 pp. Being an aggregate its
+# baseline PD is also genuinely sectoral, and its PDs top out at 0.17, so nothing is
+# censored at the upper bound.
+DEFAULT_REGIONS = ["EU27"]
 
-#: Reference narrative. Current-policies reading; see the module docstring of
-#: scenarios.py for the three candidate conventions.
-DEFAULT_BASELINE = "HWTP"
+#: The previous default, kept as the ready-made alternative when DAPS is needed.
+#: Covered by all four narratives, and deliberately not EU-only: DIRE and HWTP have
+#: *identical* PD projections on 39 of the 53 regions, including every European one.
+BASKET_REGIONS = ["EU27", "USA - USA", "China - CHN", "India - IND", "Japan - JPN", "Brazil - BRA"]
+
+#: Region the standing global reference figure is drawn on, whatever --regions says.
+WORLD_REGION = "World"
+
+# Reference narrative s_0 defining p0. The NGFS business-as-usual path, not one of the
+# four narratives: CLIMACRED defines every narrative as baseline_pd + pd_adjustment, so
+# taking the BAU as p0 makes the erosion exactly the NGFS climate increment. Passing a
+# narrative name instead measures every scenario against *that* narrative, which is a
+# different question -- see the module docstring of scenarios.py.
+DEFAULT_BASELINE = sc.BAU_LABEL
 
 
 def slug(text: str) -> str:
@@ -52,15 +66,35 @@ def slug(text: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-scenario", default=DEFAULT_BASELINE,
-                        help="reference narrative s_0 defining p0")
+                        help="reference narrative s_0 defining p0 (default: the NGFS "
+                             "business-as-usual path)")
     parser.add_argument("--regions", nargs="+", default=None,
-                        help="regions to pool into the carbon buckets")
+                        help="regions to pool (default: EU27; note 'World' has no DAPS "
+                             "rows and the elementary European regions collapse DIRE "
+                             "onto HWTP)")
+    parser.add_argument("--basket", action="store_true",
+                        help=f"shorthand for --regions {' '.join(BASKET_REGIONS)}")
+    parser.add_argument("--sectors", nargs="+", default=None,
+                        help="restrict the study to these sectors (overrides --top-sectors)")
+    parser.add_argument("--top-sectors", type=int, default=None,
+                        help="restrict to the N sectors whose PD moves most, "
+                             "ranked by --sector-criterion")
+    parser.add_argument("--sector-criterion", choices=list(sc.SECTOR_CRITERIA),
+                        default="erosion",
+                        help="how to rank sectors: erosion = |dPsi| (capital-relevant, "
+                             "censored by p_max), amplitude = |pd_adjustment|, "
+                             "dispersion = spread across narratives")
+    parser.add_argument("--granularity", choices=["sector", "carbon"], default="sector",
+                        help="one bucket per (sector x region), or collapse onto H/L")
+    parser.add_argument("--pd-max", type=float, default=None,
+                        help="upper bound of the admissible PD domain (declared "
+                             "sensitivity; default 0.50, hard bound 0.7202)")
     parser.add_argument("--year", type=int, default=None,
                         help="date for the tornado and frontier figures (default: last)")
     parser.add_argument("--r-star-convention", choices=["absolute", "relative", "both"],
                         default="both", help="breach level convention(s) to run")
     parser.add_argument("--target-ratio", type=float, default=0.13,
-                        help="baseline CET1 ratio the stylised balance sheet is pinned to")
+                        help="CET1 ratio on p0 that the stylised balance sheet is pinned to")
     parser.add_argument("--r0-year", type=int, default=None,
                         help="year defining R_0 for the relative R* convention "
                              "(default: the tightest date of the reference path)")
@@ -70,16 +104,67 @@ def main() -> None:
 
     df = load_pd(refresh=args.refresh)
     sc.check_mapping_coverage(df)
-    regions = [resolve_region(df, r) for r in (args.regions or DEFAULT_REGIONS)]
+    chosen = args.regions or (BASKET_REGIONS if args.basket else DEFAULT_REGIONS)
+    regions = [resolve_region(df, r) for r in chosen]
 
     cfg = DEFAULT_CONFIG.with_baseline_scenario(args.baseline_scenario)
-    raw = sc.aggregate_to_carbon_buckets(df, args.baseline_scenario, regions=regions)
+    if args.pd_max is not None:
+        cfg = cfg.with_pd_max(args.pd_max)
 
-    print(f"Regions   : {regions}")
-    print(f"Scenarios : {list(raw.scenarios)}")
-    print(f"Buckets   : {list(raw.buckets)}  (mapping.csv, exposure-weighted)")
-    print(f"Horizon   : {raw.dates[0]} -> {raw.dates[-1]}")
-    print(f"Baseline  : {args.baseline_scenario} — {SCENARIO_LABELS.get(args.baseline_scenario, '')}")
+    # -- sector universe. Scored on the same regions the study runs on, otherwise
+    # sectors would be chosen on evidence the study never sees.
+    selection = None
+    sectors = args.sectors
+    if sectors is None and args.top_sectors is not None:
+        selection = sc.select_sectors(
+            df, cfg, n=args.top_sectors, criterion=args.sector_criterion, regions=regions
+        )
+        sectors = list(selection.sectors)
+
+    if args.granularity == "carbon":
+        raw = sc.aggregate_to_carbon_buckets(
+            df, args.baseline_scenario, regions=regions, sectors=sectors
+        )
+        bucket_note = "mapping.csv, exposure-weighted"
+    else:
+        raw = sc.from_climacred(
+            df, args.baseline_scenario, regions=regions, sectors=sectors
+        )
+        bucket_note = "one per (sector x region)"
+
+    label = SCENARIO_LABELS.get(
+        args.baseline_scenario,
+        "NGFS business-as-usual path (CLIMACRED baseline_pd)"
+        if args.baseline_scenario == sc.BAU_LABEL
+        else "",
+    )
+    print(f"Regions       : {regions}")
+    print(f"Scenarios     : {list(raw.scenarios)}")
+    print(f"Buckets       : {raw.n_buckets} ({bucket_note})")
+    print(f"Horizon       : {raw.dates[0]} -> {raw.dates[-1]}")
+    print(f"PD domain     : [{cfg.pd_bounds[0]:.1e}, {cfg.pd_bounds[1]:.2f}]")
+    # "reference narrative", never "baseline": CLIMACRED already uses baseline_pd for
+    # the BAU *level*, and conflating the two is how p0 silently becomes a narrative
+    print(f"p0 (reference): {args.baseline_scenario} — {label}")
+
+    if selection is not None:
+        print(
+            f"\nSectors retained ({selection.criterion}, {len(selection.sectors)} of "
+            f"{len(selection.scores)}) — a restricted study is a CONCENTRATION study: "
+            "the whole book is respread over these sectors, so distances are not "
+            "comparable to another sector universe."
+        )
+        print(selection.selected_scores[list(sc.SECTOR_CRITERIA)].round(4).to_string())
+        # only worth flagging when saturation actually drove the ranking: under the
+        # other criteria the erosion column is reported but does not order anything
+        if selection.n_saturated and selection.criterion == "erosion":
+            print(
+                f"  {selection.n_saturated} of them saturate the erosion score at "
+                f"{selection.saturation_value:.4f}: p_max, not the data, sets their "
+                "score. Try --pd-max 0.5."
+            )
+    elif sectors is not None:
+        print(f"\nSectors retained (explicit): {sectors}")
 
     # -- clipping, never silent
     with warnings.catch_warnings(record=True) as caught:
@@ -92,15 +177,28 @@ def main() -> None:
             print(f"WARNING   : {w.message}")
 
     # -- balance sheet, pinned so the exercise is admissible by construction
-    port = pf.stylised_hl_portfolio(scen.dates)
+    if args.granularity == "carbon":
+        port = pf.stylised_hl_portfolio(scen.dates)
+    else:
+        # uniform weights across the retained buckets: the honest placeholder with no
+        # sector-level book, and the first assumption a reader should attack
+        port = pf.stylised_portfolio(scen.buckets, scen.dates)
     port = breach.calibrate_cet1_for_ratio(port, scen, cfg, target_ratio=args.target_ratio)
     ratio0 = breach.cet1_ratio(port, scen, cfg)
     print(
-        f"\nBalance sheet (stylised): exposure H={port.exposure[0, 0] / 1e9:.0f} bn, "
-        f"L={port.exposure[1, 0] / 1e9:.0f} bn, CET1_0={port.cet1_0 / 1e9:.1f} bn, "
-        f"RWA_oth={port.rwa_oth / 1e9:.0f} bn"
+        f"\nBalance sheet (stylised): {port.n_buckets} buckets, "
+        f"{port.total_exposure[0] / 1e9:.0f} bn total exposure, "
+        f"CET1_0={port.cet1_0 / 1e9:.1f} bn, RWA_oth={port.rwa_oth / 1e9:.0f} bn"
     )
-    print(f"Baseline CET1 ratio: {np.round(ratio0, 4).tolist()}")
+    # spell out the split when it is small enough to read: the carbon share is the
+    # parameter most likely to be varied by hand, and it must not be invisible
+    if port.n_buckets <= 6:
+        split = ", ".join(
+            f"{b}={e / 1e9:.0f} bn ({e / port.total_exposure[0]:.0%})"
+            for b, e in zip(port.buckets, port.exposure[:, 0])
+        )
+        print(f"  exposure: {split}")
+    print(f"CET1 ratio on p0: {np.round(ratio0, 4).tolist()}")
 
     # -- R* conventions.
     # R_0 anchors the relative convention. The reference CET1 ratio is *not* flat here
@@ -181,24 +279,63 @@ def main() -> None:
     worst = report.rank_scenarios(port, scen, main_cfg).index[0]
     written = []
 
-    fig = report.plot_distance_to_breach(port, scen, main_cfg)
-    path = FIGS_DIR / f"rst_distance_to_breach_{slug(main_cfg.sensitivity.r_star_convention)}.png"
+    fig = report.plot_regulatory_functions(main_cfg, scenarios=scen)
+    path = FIGS_DIR / "rst_regulatory_functions.png"
     fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     written.append(path)
+
+    # Standing global reference, always written and always on World, so a
+    # region-restricted run can still be read against the world aggregate.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # DAPS-absent-from-World already reported above
+        fig = report.plot_sector_max_pd(df, main_cfg, regions=[WORLD_REGION])
+    path = FIGS_DIR / "rst_sector_world_pd.png"
+    fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+    written.append(path)
+
+    # The study's own regions, only when they differ -- otherwise it duplicates the
+    # World figure above. This is the one whose censoring matches what the run applies.
+    if regions != [WORLD_REGION]:
+        fig = report.plot_sector_max_pd(df, main_cfg, regions=regions)
+        path = FIGS_DIR / "rst_sector_max_pd.png"
+        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
+
+    # The two breach figures are drawn for *every* admissible convention, not just the
+    # first: the conventions preserve the scenario ranking but not the breach set, so a
+    # single-convention figure shows only half the result. Filenames carry the
+    # convention, otherwise the second run would overwrite the first.
+    for candidate in usable:
+        tag = slug(candidate.sensitivity.r_star_convention)
+
+        fig = report.plot_distance_to_breach(port, scen, candidate)
+        path = FIGS_DIR / f"rst_distance_to_breach_{tag}.png"
+        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
+
+        if port.n_buckets != 2:
+            continue
+        try:
+            fig = report.plot_iso_breach_frontier(port, scen, candidate, date_index)
+        except ValueError as exc:
+            # a frontier can fall entirely outside the admissible PD square, which is a
+            # finding about that convention, not a reason to abandon the other one
+            print(f"\nno iso-breach frontier under {candidate.label}: {exc}")
+            continue
+        path = FIGS_DIR / f"rst_iso_breach_{tag}_{int(scen.dates[date_index])}.png"
+        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
 
     fig = report.plot_critical_pd_tornado(port, scen, main_cfg, worst, date_index)
     path = FIGS_DIR / f"rst_critical_pd_{slug(worst)}_{int(scen.dates[date_index])}.png"
     fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     written.append(path)
-
-    if port.n_buckets == 2:
-        fig = report.plot_iso_breach_frontier(port, scen, main_cfg, date_index)
-        path = FIGS_DIR / f"rst_iso_breach_{int(scen.dates[date_index])}.png"
-        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
-        plt.close(fig)
-        written.append(path)
 
     print()
     for path in written:
