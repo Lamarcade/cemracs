@@ -58,7 +58,7 @@ import pandas as pd
 from numpy.typing import NDArray
 
 import regulatory
-from config import PSI_MONOTONE_MAX, RstConfig
+from config import DEFAULT_CONFIG, PSI_MONOTONE_MAX, RstConfig
 
 BASE_DIR = Path(__file__).resolve().parent
 MAPPING_PATH = BASE_DIR / "mapping.csv"
@@ -517,23 +517,161 @@ def select_sectors(
 
 # -- bucket mapping ------------------------------------------------------------
 
+#: Scenario whose PD response defines the carbon buckets, and the region it is read on.
+BUCKET_SCENARIO = "HWTP"
+BUCKET_REGIONS = ("World",)
 
-def load_mapping(path: str | Path = MAPPING_PATH) -> pd.DataFrame:
-    """Read the versioned sector -> carbon bucket mapping artefact.
+#: First year with a non-zero climate increment. 2022-2023 carry ``pd_adjustment == 0``
+#: identically, so including them drags every median towards zero.
+BUCKET_START_YEAR = 2024
+
+
+def classify_transition_buckets(
+    df: pd.DataFrame,
+    scenario: str = BUCKET_SCENARIO,
+    regions: tuple[str, ...] | list[str] = BUCKET_REGIONS,
+    start_year: int = BUCKET_START_YEAR,
+) -> pd.DataFrame:
+    """Split sectors into carbon buckets from the data rather than from a taxonomy.
+
+    ``H`` is every sector whose **median ``pd_adjustment`` rises** under an ambitious
+    transition, ``L`` is everything else. This defines "brown" endogenously as "loser
+    of the transition", which is exactly the channel the model transmits -- rather than
+    as "carbon-intensive", which is a judgement imposed from outside.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Output of :func:`pd.climacred_loader.load_pd`.
+    scenario : str, optional
+        Classifying narrative. Default ``"HWTP"``.
+    regions : sequence of str, optional
+        Reference regions. Default ``("World",)`` -- an aggregate weighted by the real
+        economic mix, so the split does not depend on which regions a study happens to
+        select. The dependence is real: World gives 25 H / 25 L, EU27 gives 20 / 30.
+    start_year : int, optional
+        First year retained. Default 2024, see :data:`BUCKET_START_YEAR`.
 
     Returns
     -------
     DataFrame
-        Columns ``ngfs_sector``, ``sector_group``, ``carbon_bucket``, ``nace_codes``.
+        Columns ``ngfs_sector``, ``median_pd_adjustment``, ``carbon_bucket_transition``,
+        sorted by median descending.
+
+    Raises
+    ------
+    ValueError
+        If the scenario leaves no sector in ``L``. Only transition narratives can
+        classify: DAPS and SWUC are disaster and stagnation shocks that raise PD across
+        the whole economy, so they produce an empty green bucket. On EU27, HWTP and
+        DIRE both give 20 H / 21 L, while SWUC gives 24 / 0 and DAPS 49 / 0.
+
+    Notes
+    -----
+    **Sign, not magnitude, and the two are equivalent.** Classifying on ``Psi`` rather
+    than on PD changes nothing: ``Psi`` is strictly increasing, so
+    ``sign(Psi(p) - Psi(p0)) == sign(p - p0)``. The erosion weighting matters for
+    ranking sectors (:func:`select_sectors`), never for splitting them.
+
+    **Circularity.** Defining ``H`` as "PD rises under HWTP" and then reporting that
+    ``H`` carries the erosion under HWTP assumes the conclusion. What makes the split
+    informative is that **DAPS -- the narrative that binds in practice -- takes no part
+    in it**, so applying an HWTP-derived split to DAPS is a genuine out-of-sample test.
+    Read HWTP's own results as descriptive.
+
+    **The sign rule is arbitrary near zero.** Six sectors have a median of exactly
+    zero and land in ``L`` by convention; ``Oil Fired`` enters ``H`` on +0.015 pp. That
+    is why the median is written to the artefact next to the bucket -- the reader has
+    to be able to see which calls were close.
     """
+    sel = df[(df["scenario"] == scenario) & (df["year"] >= start_year)]
+    if regions is not None:
+        sel = sel[sel["region"].isin(list(regions))]
+    if sel.empty:
+        raise ValueError(
+            f"no rows for scenario={scenario!r}, regions={list(regions)}, "
+            f"year >= {start_year}"
+        )
+
+    median = sel.groupby("sector")["pd_adjustment"].median()
+    bucket = np.where(median > 0.0, "H", "L")
+
+    # Test for genuine winners, not merely for a non-empty L. Under the "zeros go to L"
+    # convention a scenario that improves nothing still fills L with sectors it simply
+    # does not touch -- SWUC on World does exactly that: 29 strictly positive, 21
+    # exactly zero, **0 strictly negative**. A green bucket made of indifferent sectors
+    # is not a green bucket, and the split would be meaningless.
+    n_winners = int((median < 0.0).sum())
+    n_losers = int((median > 0.0).sum())
+    if n_winners == 0 or n_losers == 0:
+        raise ValueError(
+            f"scenario {scenario!r} over {list(regions)} has {n_losers} sector(s) with "
+            f"a rising median PD and {n_winners} with a falling one, so it cannot "
+            f"classify: {int((median == 0.0).sum())} sector(s) are simply untouched and "
+            "would fill L by convention. Only transition narratives produce real "
+            "winners -- DAPS and SWUC raise PD across the whole economy."
+        )
+
+    out = pd.DataFrame(
+        {
+            "ngfs_sector": median.index,
+            "median_pd_adjustment": median.to_numpy(),
+            "carbon_bucket_transition": bucket,
+        }
+    )
+    return out.sort_values("median_pd_adjustment", ascending=False, ignore_index=True)
+
+
+#: Ways of splitting sectors into the two carbon buckets, as columns of mapping.csv.
+BUCKET_RULES = ("transition", "taxonomy")
+
+#: How sector-level PDs are collapsed onto a bucket. See
+#: :func:`aggregate_to_carbon_buckets` -- only the first is exact.
+AGGREGATION_RULES = ("certainty_equivalent", "pd_mean")
+
+#: Column of mapping.csv backing each rule.
+BUCKET_RULE_COLUMNS = {
+    "transition": "carbon_bucket_transition",
+    "taxonomy": "carbon_bucket_taxonomy",
+}
+
+
+def load_mapping(
+    path: str | Path = MAPPING_PATH, rule: str = "transition"
+) -> pd.DataFrame:
+    """Read the versioned sector -> carbon bucket mapping artefact.
+
+    Parameters
+    ----------
+    path : path, optional
+        The mapping CSV.
+    rule : {"transition", "taxonomy"}, optional
+        Which classification populates the ``carbon_bucket`` column every consumer
+        reads. ``transition`` (default) is derived from the data by
+        :func:`classify_transition_buckets`; ``taxonomy`` is the hand-written prior.
+
+    Returns
+    -------
+    DataFrame
+        The file's own columns, plus ``carbon_bucket`` filled from ``rule``.
+    """
+    if rule not in BUCKET_RULES:
+        raise ValueError(f"rule must be one of {BUCKET_RULES}, got {rule!r}")
+
     mapping = pd.read_csv(path, comment="#")
-    expected = {"ngfs_sector", "sector_group", "carbon_bucket", "nace_codes"}
+    expected = {"ngfs_sector", "sector_group", "nace_codes", *BUCKET_RULE_COLUMNS.values()}
     missing = expected - set(mapping.columns)
     if missing:
-        raise ValueError(f"{path} is missing columns {sorted(missing)}")
-    unknown = set(mapping["carbon_bucket"]) - {"H", "L"}
-    if unknown:
-        raise ValueError(f"carbon_bucket must be H or L, found {sorted(unknown)}")
+        raise ValueError(
+            f"{path} is missing columns {sorted(missing)}. Regenerate it with "
+            "build_mapping.py."
+        )
+    for column in BUCKET_RULE_COLUMNS.values():
+        unknown = set(mapping[column]) - {"H", "L"}
+        if unknown:
+            raise ValueError(f"{column} must be H or L, found {sorted(unknown)}")
+
+    mapping["carbon_bucket"] = mapping[BUCKET_RULE_COLUMNS[rule]]
     return mapping
 
 
@@ -828,13 +966,28 @@ def aggregate_to_carbon_buckets(
     sectors: list[str] | None = None,
     mapping_path: str | Path = MAPPING_PATH,
     include_bau: bool = True,
+    bucket_rule: str = "transition",
+    aggregation: str = "certainty_equivalent",
+    cfg: RstConfig | None = None,
 ) -> ScenarioSet:
     """Collapse the CLIMACRED sectors onto the two carbon buckets ``H`` and ``L``.
 
-    The aggregation is exposure-weighted: the PD of a carbon bucket is the average of
-    its sector PDs weighted by the bank's exposure to each sector. Passing uniform
-    weights is the honest default when no sector-level book is available, and it is
-    the assumption a reader will want to attack first.
+    The aggregation is exposure-weighted. Passing uniform weights is the honest default
+    when no sector-level book is available, and it is the assumption a reader will want
+    to attack first.
+
+    **What is averaged matters more than the weights.** The breach inequality is linear
+    in exposure, so grouping its terms by bucket gives
+
+    ``sum_g E_g dPsi_g = sum_buckets E_bucket * (weighted mean of dPsi over the bucket)``
+
+    -- the quantity that aggregates *exactly* is ``Psi``, not the PD. Averaging PDs is
+    exact for the provision channel ``ell*p``, which is linear, and wrong for the RWA
+    channel, since ``K(mean p) != mean K(p)``. ``K`` is concave below its peak, so
+    Jensen makes the error one-sided and it grows with the spread inside the bucket: two
+    sectors at 5% and 45% give ``K(mean p)`` 30% above ``mean K(p)``. Measured on EU27,
+    averaging PDs overstates DAPS erosion by 3% and *understates* the HWTP benefit by
+    66%.
 
     Parameters
     ----------
@@ -857,13 +1010,47 @@ def aggregate_to_carbon_buckets(
         The versioned mapping artefact.
     include_bau : bool, optional
         Append the BAU pseudo-scenario, see :func:`with_bau_scenario`. Default True.
+    bucket_rule : {"transition", "taxonomy"}, optional
+        Which column of the artefact defines the split. ``transition`` (default) is
+        derived from the data by :func:`classify_transition_buckets`; ``taxonomy`` is
+        the hand-written prior. They disagree on 15 of the 50 sectors.
+    aggregation : {"certainty_equivalent", "pd_mean"}, optional
+        ``certainty_equivalent`` (default) averages ``Psi`` and inverts it, giving each
+        bucket the single PD that reproduces the erosion of the portfolio it stands for,
+        ``p_eff = Psi^-1(mean Psi(p_g))``. Exact to machine precision against a
+        sector-granularity run. ``pd_mean`` is the biased earlier behaviour, kept so the
+        two can be compared.
+    cfg : RstConfig, optional
+        Supplies ``Psi`` for the certainty-equivalent aggregation. Defaults to
+        :data:`config.DEFAULT_CONFIG`; see the note on ``R_star`` below.
 
     Returns
     -------
     ScenarioSet
         Buckets ``("H", "L")``, PDs as fractions.
+
+    Notes
+    -----
+    **The certainty-equivalent PD depends on ``R_star``**, because ``Psi`` weights the
+    RWA channel by it. The cube is deliberately built once at ``cfg``'s breach level --
+    the Pillar 1 plus buffer reference, a regulatory constant -- and then analysed under
+    every convention, rather than rebuilt per convention. Two reasons: the relative
+    convention is *derived from* the baseline ratio, which is derived from the cube, so
+    making the cube depend on it would be circular; and a summary of the book should be
+    a fixed artefact rather than something that shifts with the threshold being tested.
+
+    **Psi-exactness is not ratio-exactness.** ``p_eff`` reproduces the erosion and the
+    cushion exactly, but :func:`breach.cet1_ratio` uses the provision and RWA channels
+    *separately*, and no single PD can match two different nonlinear functions at once.
+    The reported ratio therefore still carries a small approximation against a
+    sector-granularity run. The breach analysis itself runs entirely on ``Psi``.
     """
-    mapping = load_mapping(mapping_path)
+    if aggregation not in AGGREGATION_RULES:
+        raise ValueError(
+            f"aggregation must be one of {AGGREGATION_RULES}, got {aggregation!r}"
+        )
+    cfg = DEFAULT_CONFIG if cfg is None else cfg
+    mapping = load_mapping(mapping_path, rule=bucket_rule)
     bucket_of = dict(zip(mapping["ngfs_sector"], mapping["carbon_bucket"]))
 
     source = with_bau_scenario(df) if include_bau else df
@@ -877,7 +1064,7 @@ def aggregate_to_carbon_buckets(
     warn_dropped_scenarios(source, sel, regions, sectors)
 
     present = set(sel["sector"]).intersection(
-        load_mapping(mapping_path).query("carbon_bucket == 'H'")["ngfs_sector"]
+        mapping.query("carbon_bucket == 'H'")["ngfs_sector"]
     )
     if not present or len(set(sel["sector"])) == len(present):
         raise ValueError(
@@ -900,16 +1087,51 @@ def aggregate_to_carbon_buckets(
             unweighted = sorted(work.loc[work["weight"].isna(), "sector"].unique())
             raise ValueError(f"sector_weights has no entry for {unweighted}")
 
-    work["weighted_pd"] = work["scenario_pd"] * work["weight"]
+    if aggregation == "pd_mean":
+        work["weighted"] = work["scenario_pd"] * work["weight"] / PERCENT_POINTS
+    else:
+        # Psi has to be evaluated on the admissible domain, so the sector PDs are
+        # clipped here rather than by clip_pd downstream -- the collapsed cube comes out
+        # inside the domain by construction and would then look uncensored.
+        lo, hi = cfg.pd_bounds
+        raw = work["scenario_pd"].to_numpy() / PERCENT_POINTS
+        n_out = int(((raw < lo) | (raw > hi)).sum())
+        if n_out:
+            warnings.warn(
+                f"{n_out}/{raw.size} sector PDs ({n_out / raw.size:.1%}) clipped onto "
+                f"[{lo:.1e}, {hi:.2f}] before the H/L collapse. clip_pd will report "
+                "nothing afterwards: the collapsed cube is inside the domain by "
+                "construction, so this is the censoring the run actually applies.",
+                stacklevel=2,
+            )
+        work["weighted"] = (
+            regulatory.psi_from_config(np.clip(raw, lo, hi), cfg) * work["weight"]
+        )
+
     grouped = work.groupby(["scenario", "bucket", "year"], as_index=False).agg(
-        weighted_pd=("weighted_pd", "sum"), weight=("weight", "sum")
+        weighted=("weighted", "sum"), weight=("weight", "sum")
     )
+    mean = (grouped["weighted"] / grouped["weight"]).to_numpy()
+
+    if aggregation == "pd_mean":
+        bucket_pd = mean
+    else:
+        # invert back to the PD that reproduces the bucket's mean erosion. A convex
+        # combination of Psi values cannot leave [Psi(lo), Psi(hi)], but clip anyway so
+        # a float64 hair past the endpoint cannot turn into a NaN.
+        lo, hi = cfg.pd_bounds
+        span = (
+            float(regulatory.psi_from_config(lo, cfg)),
+            float(regulatory.psi_from_config(hi, cfg)),
+        )
+        bucket_pd = regulatory.psi_inv_from_config(np.clip(mean, *span), cfg)
+
     tidy = pd.DataFrame(
         {
             "scenario": grouped["scenario"],
             "bucket": grouped["bucket"],
             "date": grouped["year"],
-            "pd": grouped["weighted_pd"] / grouped["weight"] / PERCENT_POINTS,
+            "pd": bucket_pd,
         }
     )
     return from_tidy(tidy, baseline_scenario=baseline_scenario)

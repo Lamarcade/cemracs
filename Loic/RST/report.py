@@ -18,10 +18,16 @@ than recycling hues, which is the intended behaviour -- reduce the selection ins
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
+
+if TYPE_CHECKING:  # avoids a cycle: sweep imports breach, report imports both
+    from sweep import ShareSweep
 
 import breach
 import regulatory
@@ -37,6 +43,94 @@ import matplotlib.pyplot as plt  # noqa: E402  (backend must be set first)
 
 #: Euros per billion, for axis labels.
 BILLION = 1e9
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """The settings a figure was produced under, for its context strip.
+
+    Every figure varies one or two things and holds the rest fixed, but which is which
+    is not recoverable from the axes alone -- a distance-to-breach chart looks the same
+    whatever region, brown share or breach convention produced it. Each plot declares
+    what *it* varies and renders the rest as a footer, so no figure can be read out of
+    context or mistaken for another run.
+
+    Attributes
+    ----------
+    regions : tuple of str
+        Perimeter of the study. Rendered as a count past three entries.
+    baseline_scenario : str
+        Reference narrative ``s_0`` defining ``p0``.
+    brown_share : float or None
+        Fraction of the book in bucket ``H``.
+    target_ratio : float or None
+        Baseline CET1 ratio the balance sheet is pinned to.
+    bucket_rule, aggregation, granularity : str
+        How sectors were split and collapsed. See :mod:`scenarios`.
+    n_buckets : int or None
+        Bucket count actually used.
+    pd_bounds : tuple of float or None
+        Admissible PD domain.
+    """
+
+    regions: tuple[str, ...] = ()
+    baseline_scenario: str = ""
+    brown_share: float | None = None
+    target_ratio: float | None = None
+    bucket_rule: str = ""
+    aggregation: str = ""
+    granularity: str = ""
+    n_buckets: int | None = None
+    pd_bounds: tuple[float, float] | None = None
+
+    def caption(self, varying: tuple[str, ...] = ()) -> str:
+        """One-line summary, marking the fields the figure sweeps as ``varies``.
+
+        Parameters
+        ----------
+        varying : tuple of str
+            Any of ``"regions"``, ``"scenario"``, ``"share"``, ``"target"``,
+            ``"bucket"`` -- the caption fields, and only those. What a figure puts on
+            its axes otherwise (dates, narratives, buckets) is already legible from the
+            axes and the legend; this strip is for what is *not* visible.
+        """
+        parts: list[str] = []
+
+        def add(key: str, label: str, value: str | None) -> None:
+            if key in varying:
+                parts.append(f"{label}: varies")
+            elif value:
+                parts.append(f"{label}: {value}")
+
+        if len(self.regions) > 3:
+            where = f"{len(self.regions)} regions"
+        else:
+            where = ", ".join(self.regions)
+        add("regions", "perimeter", where)
+        add("scenario", "p0", self.baseline_scenario)
+        add("share", "brown share",
+            None if self.brown_share is None else f"{self.brown_share:.0%}")
+        add("target", "pinned at",
+            None if self.target_ratio is None else f"{self.target_ratio:.1%}")
+
+        book = " / ".join(x for x in (self.granularity, self.bucket_rule, self.aggregation) if x)
+        if self.n_buckets is not None:
+            book = f"{self.n_buckets} ({book})" if book else str(self.n_buckets)
+        add("bucket", "buckets", book or None)
+        if self.pd_bounds is not None:
+            parts.append(f"PD in [{self.pd_bounds[0]:.0e}, {self.pd_bounds[1]:.2f}]")
+        # neutral prefix: the strip lists both what is pinned and what the figure
+        # sweeps, so "held fixed" would contradict its own "varies" entries
+        return "run settings — " + "  |  ".join(parts) if parts else ""
+
+
+def _context_strip(fig: Figure, context: RunContext | None, varying: tuple[str, ...] = ()) -> None:
+    """Render the run settings under a figure. No-op when no context is supplied."""
+    if context is None:
+        return
+    text = context.caption(varying)
+    if text:
+        fig.text(0.0, -0.015, text, fontsize=8, color=vs.INK_MUTED, ha="left", va="top")
 
 
 # -- tables --------------------------------------------------------------------
@@ -201,6 +295,7 @@ def plot_sector_max_pd(
     include_bau: bool = True,
     statistic: str = "max",
     ax: plt.Axes | None = None,
+    context: RunContext | None = None,
 ) -> Figure:
     """PD reached by each sector under each scenario, against the domain bounds.
 
@@ -350,6 +445,7 @@ def plot_sector_max_pd(
         f"{int((overall > hi).sum())} of {len(peak)} sectors above p_max={hi:.2f}, "
         f"{int((overall > PSI_MONOTONE_MAX).sum())} beyond the hard bound{driver}",
     )
+    _context_strip(fig, context)
     return fig
 
 
@@ -357,6 +453,7 @@ def plot_regulatory_functions(
     cfg: RstConfig,
     scenarios: ScenarioSet | None = None,
     n_points: int = 600,
+    context: RunContext | None = None,
 ) -> Figure:
     """The regulatory layer as a function of PD: ``Psi``, ``K``, their derivatives.
 
@@ -474,6 +571,7 @@ def plot_regulatory_functions(
         ax.set_xlabel("PD (fraction, log scale)", color=vs.INK_SECONDARY, fontsize=10)
 
     fig.tight_layout(pad=2.2)
+    _context_strip(fig, context)
     return fig
 
 
@@ -483,6 +581,7 @@ def plot_distance_to_breach(
     cfg: RstConfig,
     check_cushion: bool = True,
     ax: plt.Axes | None = None,
+    context: RunContext | None = None,
 ) -> Figure:
     """Distance to breach over the horizon, one line per scenario.
 
@@ -519,6 +618,7 @@ def plot_distance_to_breach(
         "Distance to CET1 breach",
         f"Capital left before Ratio < R*, reference narrative {scenarios.baseline_scenario}",
     )
+    _context_strip(fig, context)
     return fig
 
 
@@ -531,6 +631,7 @@ def plot_critical_pd_tornado(
     n_buckets: int = 12,
     check_cushion: bool = True,
     ax: plt.Axes | None = None,
+    context: RunContext | None = None,
 ) -> Figure:
     """Tornado of per-bucket headroom: how far each bucket's PD is from its critical level.
 
@@ -590,6 +691,285 @@ def plot_critical_pd_tornado(
     else:
         subtitle += f" — hatched = unreachable even at p_max={pd_max:.2f}"
     vs.titre(ax, "How far is each bucket from breaking the ratio alone?", subtitle)
+    _context_strip(fig, context)
+    return fig
+
+
+#: Colours of the three-way breach classification, in increasing severity.
+BREACH_COLOURS = {"neither": 0, "relative only": 3, "both": 1}
+
+
+def plot_region_shock(table: pd.DataFrame, n_regions: int = 20, context: RunContext | None = None) -> Figure:
+    """Rank regions by the size of the climate shock, coloured by whether they breach.
+
+    The shock is the largest CET1 ratio drop against BAU, in percentage points -- the
+    scale that is comparable across regions, unlike a euro distance, which also carries
+    the region's risk density.
+
+    Parameters
+    ----------
+    table : DataFrame
+        Output of :func:`regions.scan_regions`.
+    n_regions : int, optional
+        How many regions to show, worst first. Default 20.
+
+    Returns
+    -------
+    Figure
+    """
+    import regions as rg
+
+    ok = table[table["status"] == "ok"].copy()
+    if ok.empty:
+        raise ValueError("no region ran successfully")
+    ok["class"] = rg.breach_class(ok)
+    shown = ok.nlargest(n_regions, "shock_pp").iloc[::-1]
+
+    palette = vs.series_colors(max(BREACH_COLOURS.values()) + 1)
+    fig, ax = plt.subplots(
+        figsize=(11, max(4.0, 0.34 * len(shown) + 2.4)), facecolor=vs.SURFACE
+    )
+
+    y = np.arange(len(shown))
+    for i, row in enumerate(shown.itertuples()):
+        colour = palette[BREACH_COLOURS[shown["class"].iloc[i]]]
+        ax.barh(i, row.shock_pp, color=colour, alpha=0.9, zorder=3)
+        ax.annotate(
+            f"{row.worst_scenario} {int(row.worst_year)}",
+            xy=(row.shock_pp, i), xytext=(6, 0), textcoords="offset points",
+            color=vs.INK_MUTED, fontsize=8, va="center",
+        )
+
+    median = float(ok["shock_pp"].median())
+    ax.axvline(median, color=vs.INK, linewidth=1.4, linestyle="--", zorder=4)
+    ax.annotate(
+        f"median of all {len(ok)} regions: {median:.2f} pp",
+        xy=(median, 1.0), xycoords=("data", "axes fraction"),
+        xytext=(4, -12), textcoords="offset points",
+        color=vs.INK_SECONDARY, fontsize=8,
+    )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(shown["region"], fontsize=9)
+    ax.set_xlim(0, float(shown["shock_pp"].max()) * 1.18)
+    vs.apply_style(ax, grid_axis="x")
+    ax.set_xlabel("largest CET1 ratio drop vs BAU (percentage points)",
+                  color=vs.INK_SECONDARY, fontsize=10)
+
+    handles = [
+        plt.Line2D([], [], marker="s", linestyle="", markersize=9,
+                   color=palette[BREACH_COLOURS[k]], label=f"breaches: {k}")
+        for k in ("both", "relative only", "neither")
+    ]
+    vs.legend(ax, handles=handles, loc="lower right")
+    counts = ok["breach_abs"].sum(), ok["breach_rel"].sum()
+    vs.titre(
+        ax,
+        "Which regions take the biggest hit?",
+        f"{int(counts[0])} of {len(ok)} regions breach under the absolute convention, "
+        f"{int(counts[1])} under the relative one",
+    )
+    _context_strip(fig, context, ('regions',))
+    return fig
+
+
+def plot_region_distance(table: pd.DataFrame, n_regions: int = 20, context: RunContext | None = None) -> Figure:
+    """Distance to breach per region under both conventions, as a dumbbell.
+
+    Shows how far the two thresholds are apart region by region, and how many regions
+    sit between them -- safe on one convention, breached on the other.
+
+    Parameters
+    ----------
+    table : DataFrame
+        Output of :func:`regions.scan_regions`.
+    n_regions : int, optional
+        How many regions to show, most breached first. Default 20.
+
+    Returns
+    -------
+    Figure
+    """
+    ok = table[table["status"] == "ok"]
+    if ok.empty:
+        raise ValueError("no region ran successfully")
+    shown = ok.nsmallest(n_regions, "dist_rel_bn").iloc[::-1]
+
+    colours = vs.series_colors(2)
+    fig, ax = plt.subplots(
+        figsize=(11, max(4.0, 0.34 * len(shown) + 2.4)), facecolor=vs.SURFACE
+    )
+
+    y = np.arange(len(shown))
+    ax.axvline(0.0, color=vs.INK, linewidth=1.6, linestyle="--", zorder=4)
+    ax.hlines(y, shown["dist_rel_bn"], shown["dist_abs_bn"],
+              color=vs.AXIS, linewidth=1.4, zorder=3)
+    ax.plot(shown["dist_abs_bn"], y, "o", color=colours[0], markersize=7,
+            label="absolute R* = 10.50 %", zorder=5)
+    ax.plot(shown["dist_rel_bn"], y, "o", color=colours[1], markersize=7,
+            label="relative R* = baseline − 300 bp", zorder=5)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(shown["region"], fontsize=9)
+    vs.apply_style(ax, grid_axis="x")
+    ax.set_xlabel("distance to breach, worst date (bn EUR) — negative is a breach",
+                  color=vs.INK_SECONDARY, fontsize=10)
+    # upper right: rows are sorted worst-first, so the top rows sit far left and leave
+    # that corner clear, whereas the bottom right is where the safe regions land
+    vs.legend(ax, loc="upper right")
+
+    split = int((~ok["breach_abs"].fillna(False) & ok["breach_rel"].fillna(False)).sum())
+    vs.titre(
+        ax,
+        "How much does the breach convention matter?",
+        f"{split} of {len(ok)} regions sit between the two thresholds — safe under the "
+        "absolute reading, breached under the relative one",
+    )
+    _context_strip(fig, context, ('regions',))
+    return fig
+
+
+def plot_share_sweep(sweeps: list["ShareSweep"], cfg: RstConfig, context: RunContext | None = None) -> Figure:
+    """Distance to breach against the carbon-intensive share, one panel per region set.
+
+    The contrast between panels is the point: how much the split matters depends
+    entirely on the geographic perimeter. On EU27 the curves are near flat and DAPS
+    *rises*; on a wider basket several narratives cross zero and a critical share
+    exists.
+
+    Parameters
+    ----------
+    sweeps : list of sweep.ShareSweep
+        One per region set, drawn side by side on a shared y axis.
+    cfg : RstConfig
+        Supplies the breach-level label.
+
+    Returns
+    -------
+    Figure
+    """
+    import sweep as sw
+
+    if not sweeps:
+        raise ValueError("no sweep to plot")
+
+    fig, axes = plt.subplots(
+        1, len(sweeps), figsize=(7.0 * len(sweeps), 6.5), squeeze=False,
+        sharey=True, facecolor=vs.SURFACE,
+    )
+    colours = vs.series_colors(len(sweeps[0].scenarios))
+
+    for ax, swept in zip(axes[0], sweeps):
+        table = sw.critical_shares(swept)
+        ax.axhline(0.0, color=vs.INK, linewidth=1.6, linestyle="--", zorder=3)
+
+        for colour, name, column in zip(colours, swept.scenarios, swept.distance.T):
+            ax.plot(swept.shares, column / BILLION, color=colour, linewidth=2.0,
+                    label=name, zorder=4)
+            crossing = table.loc[name, "critical_share"]
+            if np.isfinite(crossing):
+                ax.plot([crossing], [0.0], "o", color=colour, markersize=9, zorder=6)
+                ax.annotate(
+                    f"{crossing:.0%}", xy=(crossing, 0.0), xytext=(0, -16),
+                    textcoords="offset points", color=colour, fontsize=9,
+                    ha="center", fontweight="bold",
+                )
+
+        if swept.inadmissible.any():
+            ax.axvspan(swept.shares[swept.inadmissible].min(),
+                       swept.shares[swept.inadmissible].max(),
+                       color=vs.INK_MUTED, alpha=0.20, zorder=1)
+
+        vs.apply_style(ax, grid_axis="both")
+        ax.set_xlabel("share of the book in bucket H (brown)",
+                      color=vs.INK_SECONDARY, fontsize=10)
+        n_crossing = int(np.isfinite(table["critical_share"]).sum())
+        vs.titre(
+            ax,
+            swept.region_label or "carbon share sweep",
+            f"{n_crossing} of {len(table)} narratives cross zero"
+            if n_crossing else "no narrative crosses zero on this perimeter",
+        )
+
+    axes[0][0].set_ylabel("distance to breach, worst date (bn EUR)",
+                          color=vs.INK_SECONDARY, fontsize=10)
+    vs.legend(axes[0][-1], loc="best")
+    fig.suptitle(
+        f"Does the brown/green split decide the outcome?  —  {cfg.label}",
+        color=vs.INK, fontsize=13, fontweight="bold", x=0.01, ha="left",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _context_strip(fig, context, ('share', 'regions'))
+    return fig
+
+
+def plot_share_target_map(grid: pd.DataFrame, cfg: RstConfig, context: RunContext | None = None) -> Figure:
+    """Worst-scenario distance over a ``share x target_ratio`` grid, with the zero contour.
+
+    The honest companion to :func:`plot_share_sweep`: the breach frontier runs almost
+    horizontally, so capitalisation decides the outcome and the brown/green split only
+    modulates it.
+
+    Parameters
+    ----------
+    grid : DataFrame
+        Output of :func:`sweep.sweep_share_and_target`, in euros.
+    cfg : RstConfig
+
+    Returns
+    -------
+    Figure
+    """
+    values = grid.to_numpy() / BILLION
+    shares = grid.columns.to_numpy(dtype=float)
+    targets = grid.index.to_numpy(dtype=float)
+
+    # rows at or below R_star are all-NaN by construction: pinning the bank below the
+    # threshold it is judged against starts it in breach. They render blank.
+    usable = ~np.isnan(values).all(axis=1)
+    n_dropped = int((~usable).sum())
+
+    fig, ax = plt.subplots(figsize=(11, 6.0), facecolor=vs.SURFACE)
+
+    # Diverging ramp centred on zero: the sign is the whole message, and viz_style's
+    # neutral midpoint keeps "no breach margin" from looking like a value. Reversed so
+    # that breach reads red and headroom reads blue -- the ramp runs blue-to-red, which
+    # would otherwise paint the safe corner in alarm colours.
+    limit = float(np.nanmax(np.abs(values)))
+    norm = mcolors.TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
+    mesh = ax.pcolormesh(shares, targets, values, cmap=vs.DIVERGING.reversed(),
+                         norm=norm, shading="nearest")
+    contour = ax.contour(shares, targets, values, levels=[0.0],
+                         colors=[vs.INK], linewidths=2.4)
+    ax.clabel(contour, fmt={0.0: "breach frontier"}, fontsize=9)
+
+    bar = fig.colorbar(mesh, ax=ax, pad=0.02)
+    bar.set_label("distance to breach (bn EUR)", color=vs.INK_SECONDARY, fontsize=9)
+    bar.ax.tick_params(colors=vs.INK_MUTED, labelsize=8)
+
+    ax.set_xlabel("share of the book in bucket H (brown)",
+                  color=vs.INK_SECONDARY, fontsize=10)
+    ax.set_ylabel("baseline CET1 ratio it is pinned to",
+                  color=vs.INK_SECONDARY, fontsize=10)
+    ax.tick_params(colors=vs.INK_MUTED, labelsize=9, length=0)
+
+    kept = values[usable]
+    span_share = float(np.nanmax(np.abs(kept[:, -1] - kept[:, 0])))
+    span_target = float(np.nanmax(np.abs(kept[-1, :] - kept[0, :])))
+    ratio = span_target / max(span_share, 1e-12)
+    # kept on two short lines: a single long subtitle stretches the figure under
+    # bbox_inches="tight" and leaves half the canvas empty
+    note = (
+        f"\n{n_dropped} row(s) blank: pinned at or below R*, the bank starts in breach"
+        if n_dropped else ""
+    )
+    vs.titre(
+        ax,
+        "Composition or capitalisation?",
+        f"{cfg.label} — the target ratio moves the distance {ratio:.0f}x more than the "
+        f"brown share ({span_target:.1f} vs {span_share:.1f} bn){note}",
+    )
+    _context_strip(fig, context, ('share', 'target'))
     return fig
 
 
@@ -600,6 +980,7 @@ def plot_iso_breach_frontier(
     date_index: int,
     check_cushion: bool = True,
     ax: plt.Axes | None = None,
+    context: RunContext | None = None,
 ) -> Figure:
     """Iso-breach curve in the ``(p_H, p_L)`` plane, with the scenarios plotted on it.
 
@@ -637,9 +1018,17 @@ def plot_iso_breach_frontier(
     ax.set_xlabel(f"PD of bucket {portfolio.buckets[0]}", color=vs.INK_SECONDARY, fontsize=10)
     ax.set_ylabel(f"PD of bucket {portfolio.buckets[1]}", color=vs.INK_SECONDARY, fontsize=10)
     vs.legend(ax, loc="upper right")
+    # name the date and whether it is the binding one: this is a single-date snapshot,
+    # and drawn at the wrong date it appears to contradict the distance-to-breach chart
+    binding = breach.binding_cell(portfolio, scenarios, cfg, check_cushion=check_cushion)[1]
+    when = (
+        "the binding date" if binding == date_index
+        else f"NOT the binding date, which is {int(scenarios.dates[binding])}"
+    )
     vs.titre(
         ax,
-        "Iso-breach frontier",
-        f"{int(scenarios.dates[date_index])}, {cfg.label} — decreasing level set of a separable increasing function",
+        f"Iso-breach frontier at {int(scenarios.dates[date_index])}",
+        f"{cfg.label} — {when}. Decreasing level set of a separable increasing function",
     )
+    _context_strip(fig, context)
     return fig

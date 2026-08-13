@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import warnings
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -25,6 +26,7 @@ import breach
 import portfolio as pf
 import report
 import scenarios as sc
+import sweep as sw
 from config import DEFAULT_CONFIG
 from pd.climacred_loader import SCENARIO_LABELS, load_pd, resolve_region
 
@@ -86,6 +88,15 @@ def main() -> None:
                              "dispersion = spread across narratives")
     parser.add_argument("--granularity", choices=["sector", "carbon"], default="sector",
                         help="one bucket per (sector x region), or collapse onto H/L")
+    parser.add_argument("--bucket-rule", choices=list(sc.BUCKET_RULES),
+                        default="transition",
+                        help="H/L split: transition = data-driven (sectors whose median "
+                             "PD rises under HWTP), taxonomy = the hand-written prior")
+    parser.add_argument("--aggregation", choices=list(sc.AGGREGATION_RULES),
+                        default="certainty_equivalent",
+                        help="how sectors collapse onto H/L: certainty_equivalent "
+                             "averages Psi and inverts it (exact), pd_mean averages PDs "
+                             "(biased, kept for comparison)")
     parser.add_argument("--pd-max", type=float, default=None,
                         help="upper bound of the admissible PD domain (declared "
                              "sensitivity; default 0.50, hard bound 0.7202)")
@@ -98,6 +109,11 @@ def main() -> None:
     parser.add_argument("--r0-year", type=int, default=None,
                         help="year defining R_0 for the relative R* convention "
                              "(default: the tightest date of the reference path)")
+    parser.add_argument("--sweep-points", type=int, default=21,
+                        help="grid size of the brown/green share sweep")
+    parser.add_argument("--sweep-targets", nargs="+", type=float,
+                        default=list(sw.DEFAULT_TARGETS),
+                        help="baseline CET1 ratios of the share x target grid")
     parser.add_argument("--refresh", action="store_true",
                         help="ignore the cache and re-read the .xlsx")
     args = parser.parse_args()
@@ -123,9 +139,15 @@ def main() -> None:
 
     if args.granularity == "carbon":
         raw = sc.aggregate_to_carbon_buckets(
-            df, args.baseline_scenario, regions=regions, sectors=sectors
+            df, args.baseline_scenario, regions=regions, sectors=sectors,
+            bucket_rule=args.bucket_rule, aggregation=args.aggregation, cfg=cfg,
         )
-        bucket_note = "mapping.csv, exposure-weighted"
+        split = sc.load_mapping(rule=args.bucket_rule)["carbon_bucket"].value_counts()
+        bucket_note = (
+            f"mapping.csv rule '{args.bucket_rule}', "
+            f"{int(split.get('H', 0))}H/{int(split.get('L', 0))}L, "
+            f"{args.aggregation}"
+        )
     else:
         raw = sc.from_climacred(
             df, args.baseline_scenario, regions=regions, sectors=sectors
@@ -273,13 +295,35 @@ def main() -> None:
             "(machine precision expected — the breach set does not depend on p0)"
         )
 
-    # -- figures
+    # -- figures. Single-date figures default to the *binding* date, not the end of the
+    # horizon: on EU27 the run breaches at 2027 while 2030 is comfortably positive, so a
+    # frontier drawn at the last date contradicts the distance-to-breach chart for no
+    # reason other than the date.
     FIGS_DIR.mkdir(parents=True, exist_ok=True)
-    date_index = scen.n_dates - 1 if args.year is None else scen.date_index(args.year)
+    if args.year is None:
+        date_index = breach.binding_cell(port, scen, main_cfg, check_cushion=False)[1]
+        print(f"\nSingle-date figures drawn at the binding date: "
+              f"{int(scen.dates[date_index])} (pass --year to override)")
+    else:
+        date_index = scen.date_index(args.year)
     worst = report.rank_scenarios(port, scen, main_cfg).index[0]
+    # every figure carries the settings it was produced under, so none can be read out
+    # of context or confused with another run
+    context = report.RunContext(
+        regions=tuple(regions),
+        baseline_scenario=args.baseline_scenario,
+        brown_share=(port.exposure[0, 0] / port.total_exposure[0]
+                     if port.n_buckets == 2 else None),
+        target_ratio=args.target_ratio,
+        bucket_rule=args.bucket_rule if args.granularity == "carbon" else "",
+        aggregation=args.aggregation if args.granularity == "carbon" else "",
+        granularity=args.granularity,
+        n_buckets=port.n_buckets,
+        pd_bounds=cfg.pd_bounds,
+    )
     written = []
 
-    fig = report.plot_regulatory_functions(main_cfg, scenarios=scen)
+    fig = report.plot_regulatory_functions(main_cfg, scenarios=scen, context=context)
     path = FIGS_DIR / "rst_regulatory_functions.png"
     fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
@@ -289,7 +333,8 @@ def main() -> None:
     # region-restricted run can still be read against the world aggregate.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # DAPS-absent-from-World already reported above
-        fig = report.plot_sector_max_pd(df, main_cfg, regions=[WORLD_REGION])
+        fig = report.plot_sector_max_pd(df, main_cfg, regions=[WORLD_REGION],
+                                        context=replace(context, regions=(WORLD_REGION,)))
     path = FIGS_DIR / "rst_sector_world_pd.png"
     fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
@@ -298,7 +343,7 @@ def main() -> None:
     # The study's own regions, only when they differ -- otherwise it duplicates the
     # World figure above. This is the one whose censoring matches what the run applies.
     if regions != [WORLD_REGION]:
-        fig = report.plot_sector_max_pd(df, main_cfg, regions=regions)
+        fig = report.plot_sector_max_pd(df, main_cfg, regions=regions, context=context)
         path = FIGS_DIR / "rst_sector_max_pd.png"
         fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
@@ -311,7 +356,7 @@ def main() -> None:
     for candidate in usable:
         tag = slug(candidate.sensitivity.r_star_convention)
 
-        fig = report.plot_distance_to_breach(port, scen, candidate)
+        fig = report.plot_distance_to_breach(port, scen, candidate, context=context)
         path = FIGS_DIR / f"rst_distance_to_breach_{tag}.png"
         fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
@@ -319,23 +364,76 @@ def main() -> None:
 
         if port.n_buckets != 2:
             continue
+        # each convention gets its own binding date: they need not coincide, and a
+        # frontier is only informative at the date that decides the outcome
+        iso_index = (
+            breach.binding_cell(port, scen, candidate, check_cushion=False)[1]
+            if args.year is None else date_index
+        )
         try:
-            fig = report.plot_iso_breach_frontier(port, scen, candidate, date_index)
+            fig = report.plot_iso_breach_frontier(port, scen, candidate, iso_index, context=context)
         except ValueError as exc:
             # a frontier can fall entirely outside the admissible PD square, which is a
             # finding about that convention, not a reason to abandon the other one
             print(f"\nno iso-breach frontier under {candidate.label}: {exc}")
             continue
-        path = FIGS_DIR / f"rst_iso_breach_{tag}_{int(scen.dates[date_index])}.png"
+        path = FIGS_DIR / f"rst_iso_breach_{tag}_{int(scen.dates[iso_index])}.png"
         fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
         written.append(path)
 
-    fig = report.plot_critical_pd_tornado(port, scen, main_cfg, worst, date_index)
+    fig = report.plot_critical_pd_tornado(port, scen, main_cfg, worst, date_index, context=context)
     path = FIGS_DIR / f"rst_critical_pd_{slug(worst)}_{int(scen.dates[date_index])}.png"
     fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     written.append(path)
+
+    # -- brown/green share sweep. Always on the two-bucket book, so it runs from its own
+    # H/L cube rather than the study's -- which may be at sector granularity.
+    perimeters = [(regions, ", ".join(regions))]
+    if regions != BASKET_REGIONS:
+        perimeters.append((BASKET_REGIONS, "basket of 6 regions"))
+
+    cubes = []
+    for perimeter, label in perimeters:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # already reported for the study perimeter
+            cube = sc.aggregate_to_carbon_buckets(
+                df, args.baseline_scenario, regions=perimeter,
+                sectors=sectors, bucket_rule=args.bucket_rule,
+                aggregation=args.aggregation, cfg=cfg,
+            )
+            cube, _ = sc.clip_pd(cube, cfg, warn=False)
+        cubes.append((cube, label))
+
+    for candidate in usable:
+        tag = slug(candidate.sensitivity.r_star_convention)
+        sweeps = [
+            sw.sweep_carbon_share(cube, candidate, n_points=args.sweep_points,
+                                  target_ratio=args.target_ratio, region_label=label)
+            for cube, label in cubes
+        ]
+
+        print(f"\nCritical brown share under {candidate.label}:")
+        for swept in sweeps:
+            print(f"  [{swept.region_label}]")
+            print(sw.critical_shares(swept).round(3).to_string())
+
+        fig = report.plot_share_sweep(sweeps, candidate, context=context)
+        path = FIGS_DIR / f"rst_share_sweep_{tag}.png"
+        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
+
+        grid = sw.sweep_share_and_target(
+            cubes[0][0], candidate, n_points=args.sweep_points,
+            targets=args.sweep_targets,
+        )
+        fig = report.plot_share_target_map(grid, candidate, context=context)
+        path = FIGS_DIR / f"rst_share_target_map_{tag}.png"
+        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
 
     print()
     for path in written:

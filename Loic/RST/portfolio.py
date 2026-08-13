@@ -40,6 +40,12 @@ BASE_DIR = Path(__file__).resolve().parent
 HIGH_CARBON = "H"
 LOW_CARBON = "L"
 
+#: Default fraction of the book in bucket ``H``. An even split -- a neutral starting
+#: point rather than a claim about any real book, and the midpoint of the sweep in
+#: :mod:`sweep`. Exposed as a constant so drivers can report the value they used
+#: instead of leaving it implicit.
+DEFAULT_HIGH_CARBON_SHARE = 0.50
+
 
 @dataclass(frozen=True)
 class Portfolio:
@@ -284,7 +290,7 @@ def stylised_portfolio(
 def stylised_hl_portfolio(
     dates: NDArray[np.int64] | list[int],
     corporate_book: float = 300e9,
-    high_carbon_share: float = 0.60,
+    high_carbon_share: float = DEFAULT_HIGH_CARBON_SHARE,
     cet1_0: float = 45e9,
     rwa_oth: float = 60e9,
 ) -> Portfolio:
@@ -302,7 +308,9 @@ def stylised_hl_portfolio(
     corporate_book : float, optional
         Total corporate exposure in euros. Default 300 billion.
     high_carbon_share : float, optional
-        Fraction of the book in the carbon-intensive bucket ``H``. Default 0.20.
+        Fraction of the book in the carbon-intensive bucket ``H``. Default 0.50, an
+        even split -- a neutral starting point rather than a claim about any real book,
+        and the midpoint of the sweep in :mod:`sweep`.
     cet1_0 : float, optional
         CET1 capital at date 0, in euros. Default 45 billion.
     rwa_oth : float, optional

@@ -42,7 +42,7 @@ upstream, and the erosion is a single broadcast -- there is no loop over scenari
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from numpy.typing import NDArray
@@ -275,6 +275,30 @@ def distance_to_breach(
     return h[None, :] - erosion(portfolio, scenarios, cfg)
 
 
+def binding_cell(
+    portfolio: Portfolio, scenarios: ScenarioSet, cfg: RstConfig, check_cushion: bool = True
+) -> tuple[int, int]:
+    """Indices of the tightest ``(scenario, date)`` cell of the horizon.
+
+    Returns
+    -------
+    tuple of int
+        ``(scenario_index, date_index)`` where the distance to breach is smallest --
+        the cell that decides whether the exercise breaches at all.
+
+    Notes
+    -----
+    Any single-date figure should be drawn here rather than at the end of the horizon.
+    The two do not coincide: on EU27 the binding cell is DAPS in 2027, while 2030 is
+    comfortably positive under both conventions. A frontier drawn at the last date
+    shows no breach even when the run reports one, which reads as a contradiction
+    between figures when it is only a difference of date.
+    """
+    distance = distance_to_breach(portfolio, scenarios, cfg, check_cushion)
+    s, n = np.unravel_index(int(distance.argmin()), distance.shape)
+    return int(s), int(n)
+
+
 def breach_matrix(
     portfolio: Portfolio, scenarios: ScenarioSet, cfg: RstConfig, check_cushion: bool = True
 ) -> NDArray[np.bool_]:
@@ -491,3 +515,138 @@ def iso_breach_frontier(
     target_low = (constant - e_high * regulatory.psi_from_config(p_high, cfg)) / e_low
     p_low = regulatory.psi_inv_from_config(target_low, cfg)
     return p_high, p_low
+
+
+# -- consistency of the two forms ----------------------------------------------
+
+
+def check_forms_agree(
+    portfolio: Portfolio, scenarios: ScenarioSet, cfg: RstConfig
+) -> dict[str, float | int]:
+    """Verify that the affine breach form reproduces the ratio form exactly.
+
+    The central check of the whole derivation. Equation (12) of the note -- the affine
+    condition this module is built on -- is claimed to be an *exact* rewrite of (11),
+    the ratio evaluated directly. Any gap is an algebra or sign error, not a numerical
+    tolerance issue, so this compares both the signed quantity and the breach flag over
+    every ``(scenario, date)`` cell.
+
+    Two things are checked:
+
+    ``CET1[n] - R* RWA[n]  ==  H[n] - Erosion[n]``
+        The identity itself. Expanding the left side, ``CET1_RE`` and ``RWA_oth``
+        cancel between the two, and what is left regroups bucket by bucket into
+        ``Psi``. Should hold to machine precision.
+
+    ``Ratio[n] < R*  <=>  Erosion[n] > H[n]``
+        The flag, which follows from the identity because ``RWA[n] > 0``. Checked
+        separately because a cell sitting exactly on the boundary could in principle
+        disagree on rounding alone -- the returned ``tightest_cell`` reports how close
+        the grid ever gets.
+
+    Returns
+    -------
+    dict
+        ``max_abs_gap``, ``max_rel_gap``, ``n_cells``, ``n_breach_ratio``,
+        ``n_breach_affine``, ``n_flag_disagreements``, ``tightest_cell``.
+
+    Raises
+    ------
+    ValueError
+        If the flags disagree anywhere, quoting the offending cells.
+    """
+    _check_aligned(portfolio, scenarios)
+    kappa = cfg.sensitivity.kappa_tax
+    cet1_re = portfolio.cet1_re(cfg)
+
+    # (11), evaluated directly, scenario by scenario
+    provision = (1.0 - kappa) * np.einsum(
+        "gn,sgn->sn", cfg.ell * portfolio.exposure, scenarios.pd_cube
+    )
+    charge = regulatory.capital_charge(scenarios.pd_cube, cfg.ell)
+    rwa = portfolio.rwa_oth + cfg.regulatory.rwa_factor * np.einsum(
+        "gn,sgn->sn", portfolio.exposure, charge
+    )
+    cet1 = cet1_re[None, :] - provision
+    ratio = cet1 / rwa
+    signed = cet1 - cfg.r_star * rwa
+
+    # (12), the affine form this module actually uses
+    affine = distance_to_breach(portfolio, scenarios, cfg, check_cushion=False)
+
+    gap = np.abs(signed - affine)
+    scale = max(float(np.abs(affine).max()), 1.0)
+    flag_ratio = ratio < cfg.r_star
+    flag_affine = affine < 0.0
+    disagree = np.nonzero(flag_ratio != flag_affine)
+
+    if disagree[0].size:
+        cells = [
+            f"{scenarios.scenarios[s]}@{int(scenarios.dates[n])} "
+            f"(ratio {ratio[s, n]:.6f} vs R*={cfg.r_star:.6f}, affine {affine[s, n]:+.3e})"
+            for s, n in zip(*disagree)
+        ]
+        raise ValueError(
+            "the affine breach form disagrees with the ratio form on "
+            f"{len(cells)} cell(s): {cells}. (12) is supposed to be an exact rewrite "
+            "of (11), so this is a derivation or sign error, not a tolerance issue."
+        )
+
+    s, n = np.unravel_index(int(np.abs(affine).argmin()), affine.shape)
+    return {
+        "max_abs_gap": float(gap.max()),
+        "max_rel_gap": float(gap.max() / scale),
+        "n_cells": int(affine.size),
+        "n_breach_ratio": int(flag_ratio.sum()),
+        "n_breach_affine": int(flag_affine.sum()),
+        "n_flag_disagreements": 0,
+        "tightest_cell": float(np.abs(affine[s, n])),
+    }
+
+
+if __name__ == "__main__":
+    # Self-check, not a test suite (tests are out of scope for this iteration).
+    # Data-free and deterministic, so it runs without the CLIMACRED workbook. The grid
+    # is built to straddle the breach boundary in both directions -- a check where no
+    # cell ever breaches would pass while proving nothing about the sign convention.
+    import portfolio as pf
+    from config import DEFAULT_CONFIG
+    from scenarios import ScenarioSet
+
+    lo, hi = DEFAULT_CONFIG.pd_bounds
+    dates = np.arange(2022, 2031, dtype=np.int64)
+    buckets = ("H", "M", "L")
+    rng = np.random.default_rng(0)
+
+    baseline = np.geomspace(0.004, 0.02, len(buckets))[:, None] * np.ones(len(dates))
+    shocks = [0.0, 0.5, 1.5, 4.0, 12.0]  # multiples of the baseline, mild to extreme
+    cube = np.clip(
+        np.stack([baseline * (1.0 + k) for k in shocks])
+        * rng.uniform(0.9, 1.1, (len(shocks), len(buckets), len(dates))),
+        lo, hi,
+    )
+    cube[0] = baseline  # scenario 0 is the reference narrative, erosion identically 0
+
+    scen = ScenarioSet(
+        scenarios=tuple(f"S{k}" for k in range(len(shocks))),
+        buckets=buckets, dates=dates, pd_cube=cube, baseline_scenario="S0",
+    )
+    port = pf.stylised_portfolio(buckets, dates, corporate_book=300e9, rwa_oth=60e9)
+    port = calibrate_cet1_for_ratio(port, scen, DEFAULT_CONFIG, target_ratio=0.13)
+
+    print(f"{'kappa_tax':>10} {'R*':>8} {'cells':>6} {'breach(11)':>11} "
+          f"{'breach(12)':>11} {'rel gap':>10} {'tightest':>12}")
+    for kappa in (0.0, 0.25):
+        for r_star in (0.105, 0.125, 0.14):
+            cfg = replace(
+                DEFAULT_CONFIG,
+                sensitivity=replace(
+                    DEFAULT_CONFIG.sensitivity, r_star=r_star, kappa_tax=kappa
+                ),
+            )
+            out = check_forms_agree(port, scen, cfg)
+            print(f"{kappa:10.2f} {r_star:8.3f} {out['n_cells']:6d} "
+                  f"{out['n_breach_ratio']:11d} {out['n_breach_affine']:11d} "
+                  f"{out['max_rel_gap']:10.2e} {out['tightest_cell'] / 1e9:9.3f} bn")
+
+    print("\n(11) and (12) agree on every cell, flags included, at every setting above.")
