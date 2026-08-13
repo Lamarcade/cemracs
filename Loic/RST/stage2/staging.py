@@ -32,6 +32,7 @@ admissibility (assumption 8) is preserved by construction.
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
@@ -43,6 +44,108 @@ LIFETIME_WINDOW = 2.5
 #: Default ``Thresh``: a bucket migrates when its PD reaches this multiple of the
 #: baseline. 2.0 mirrors the usual IFRS 9 practice of a doubling.
 SICR_THRESHOLD = 2.0
+
+
+@dataclass(frozen=True)
+class SicrRule:
+    """A significant-increase-in-credit-risk trigger.
+
+    Attributes
+    ----------
+    thresh : float
+        Multiple of the reference PD at which the relative trigger fires. 3.0 is the
+        supervisory backstop -- a threefold increase, i.e. a 200% rise.
+    absolute_backstop : float or None
+        Reporting-date 12-month PD above which SICR is triggered **on its own**,
+        whatever the ratio. 0.20 in the ECB reading. This is an ``OR``, not a filter:
+        a deeply impaired obligor is in Stage 2 even if its PD has not tripled.
+    low_risk_floor : float or None
+        Low credit risk exemption. The *relative* trigger applies only where the
+        initial **or** the current PD sits above this level; below it, a tripling is
+        immaterial in absolute terms and does not by itself signal SICR. 0.003 in the
+        ECB reading. Does not affect the absolute backstop.
+    reference : {"origination", "same_date"}
+        What the current PD is compared against.
+
+        ``origination`` is IFRS 9 as written: ``scenario_pd[n] / scenario_pd[t_0]``,
+        the total PD now against the total PD when the book was written. The reference
+        narrative is judged against its own origination too, so **it can migrate** --
+        and on this data it does, on 88% of cells, because the CLIMACRED baseline
+        triples between 2022 and 2023. That is not an artefact to suppress: a real
+        book whose PD triples does move to Stage 2, whatever the cause.
+
+        ``same_date`` compares to the contemporaneous baseline,
+        ``p_scenario[n] / p_baseline[n]``, isolating the climate increment. The
+        reference narrative then has a ratio of exactly 1 and never migrates.
+    name : str
+        Label carried into the reports.
+
+    Notes
+    -----
+    The two PD levels pull in **opposite directions**, which is easy to get backwards.
+    The 20% figure *adds* cells to Stage 2 on its own; it is not a ceiling above which
+    the relative test stops applying. The 0.3% figure *removes* cells, and only from the
+    relative test -- an obligor above 20% is in Stage 2 regardless.
+    """
+
+    thresh: float
+    absolute_backstop: float | None = 0.20
+    low_risk_floor: float | None = 0.003
+    reference: str = "origination"
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        if self.thresh <= 1.0:
+            raise ValueError(f"thresh must exceed 1, got {self.thresh}")
+        if self.reference not in ("origination", "same_date"):
+            raise ValueError(
+                f"reference must be 'origination' or 'same_date', got {self.reference!r}"
+            )
+        for name, value in (("absolute_backstop", self.absolute_backstop),
+                            ("low_risk_floor", self.low_risk_floor)):
+            if value is not None and not 0.0 < value < 1.0:
+                raise ValueError(f"{name} must be a fraction in (0, 1), got {value}")
+
+    @property
+    def stages_baseline(self) -> bool:
+        """Whether the reference narrative can itself migrate.
+
+        True under ``origination``, and it is what forces the cushion and the
+        calibration to be recomputed on a staged baseline -- see
+        :func:`stage2.breach2.cushion_staged`.
+        """
+        return self.reference == "origination"
+
+    @property
+    def label(self) -> str:
+        """Human-readable description, for figure subtitles and the run header."""
+        if self.name:
+            return self.name
+        denominator = "p(t0)" if self.stages_baseline else "p_baseline(t)"
+        parts = [f"p / {denominator} > {self.thresh:g}"]
+        if self.low_risk_floor is not None:
+            parts[0] += f" (if PD > {self.low_risk_floor:.1%})"
+        if self.absolute_backstop is not None:
+            parts.append(f"p > {self.absolute_backstop:.0%}")
+        return " OR ".join(parts)
+
+
+#: A plain relative trigger, with neither backstop nor exemption. The reference point
+#: for measuring what the two supervisory levels actually add.
+SIMPLE_RULE = SicrRule(SICR_THRESHOLD, None, None, "origination",
+                       "doubling since origination, no backstop")
+
+#: The ECB reading: a threefold rise since initial recognition, subject to the low
+#: credit risk exemption, **or** a reporting-date PD above 20% on its own.
+ECB_RULE = SicrRule(3.0, 0.20, 0.003, "origination", "")
+
+#: Climate-attribution variant: the trigger measures the increment over the
+#: contemporaneous baseline, so the reference narrative never migrates.
+CLIMATE_RULE = SicrRule(SICR_THRESHOLD, None, None, "same_date",
+                        "doubling vs the same-date baseline")
+
+#: Selectable presets, for the driver.
+SICR_RULES = {"simple": SIMPLE_RULE, "ecb": ECB_RULE, "climate": CLIMATE_RULE}
 
 
 def lifetime_pd(
@@ -102,33 +205,50 @@ def lifetime_pd(
 def sicr_flags(
     pd_cube: NDArray[np.float64],
     baseline_pd: NDArray[np.float64],
-    thresh: float = SICR_THRESHOLD,
+    rule: SicrRule = SIMPLE_RULE,
 ) -> NDArray[np.bool_]:
     """Which ``(scenario, bucket, date)`` cells have migrated to Stage 2.
 
-    ``p[s,g,n] / p0[g,n] > thresh``, **re-tested at every date**. A bucket returns to
-    Stage 1 as soon as its ratio falls back below the threshold, which IFRS 9 permits
-    and which matters here: the DAPS shock is transient, migrating 36% of buckets in
-    2027 and none in 2028. An absorbing rule would keep them in Stage 2 to the end of
-    the horizon and hide that.
+    ``p[s,g,n] / p0[g,n] > thresh``, optionally restricted to an applicability band on
+    ``p``, and **re-tested at every date**. A bucket returns to Stage 1 as soon as it
+    falls back below the trigger, which IFRS 9 permits and which matters here: the DAPS
+    shock is transient, migrating 36% of buckets in 2027 and none in 2028. An absorbing
+    rule would keep them in Stage 2 to the end of the horizon and hide that.
 
     Returns
     -------
     ndarray of bool
-        Same shape as ``pd_cube``. Identically False on the reference narrative.
+        Same shape as ``pd_cube``. Under ``same_date`` it is identically False on the
+        reference narrative; under ``origination`` the reference narrative migrates
+        like any other, which is the point of that rule.
     """
-    if thresh <= 1.0:
-        raise ValueError(
-            f"thresh must exceed 1, got {thresh}: at or below 1 the reference narrative "
-            "triggers against itself and the cushion stops being Stage 1."
-        )
-    return pd_cube > thresh * baseline_pd[None, :, :]
+    if rule.stages_baseline:
+        # (baseline + pd_adjustment) now, over the same quantity at origination. At
+        # t_0 the adjustment is identically zero, so every narrative shares the same
+        # denominator -- the book was written before any of them diverged.
+        reference = pd_cube[:, :, :1]
+    else:
+        reference = baseline_pd[None, :, :]
+
+    relative = pd_cube > rule.thresh * reference
+    if rule.low_risk_floor is not None:
+        # low credit risk exemption: the relative test needs the initial OR the current
+        # PD to be material. Both below the floor and a tripling means nothing.
+        floor = rule.low_risk_floor
+        relative &= (reference > floor) | (pd_cube > floor)
+
+    triggered = relative
+    if rule.absolute_backstop is not None:
+        # a backstop ADDS cells, it does not filter them: past this level the obligor
+        # is in Stage 2 whatever its ratio has done
+        triggered = triggered | (pd_cube > rule.absolute_backstop)
+    return triggered
 
 
 def provision_multiplier(
     pd_cube: NDArray[np.float64],
     baseline_pd: NDArray[np.float64],
-    thresh: float = SICR_THRESHOLD,
+    rule: SicrRule = SIMPLE_RULE,
     window: float = LIFETIME_WINDOW,
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
     """The per-cell factor on the provision channel, and the flags that produced it.
@@ -154,16 +274,17 @@ def provision_multiplier(
 
     Notes
     -----
-    Two invariants hold by construction and are asserted rather than trusted:
+    ``multiplier >= 1`` everywhere and is asserted, since ``LT`` opens with the full
+    12-month term.
 
-    ``multiplier >= 1`` everywhere, since ``LT`` opens with the full 12-month term.
-
-    ``multiplier == 1`` on the reference narrative, which compares to itself and so can
-    never trigger. That is what keeps ``H[n]`` the Stage 1 cushion and lets
-    :func:`breach.cushion` and :func:`breach.calibrate_cet1_for_ratio` be reused as they
-    stand.
+    Whether the **reference narrative** carries a multiplier of 1 depends on the rule.
+    Under ``same_date`` it does, and the cushion is then the Stage 1 one. Under
+    ``origination`` it does not: the baseline migrates too, so the cushion and the
+    calibration must both be recomputed on the staged baseline provision --
+    :func:`stage2.breach2.cushion_staged` and
+    :func:`stage2.breach2.calibrate_staged` exist for exactly that.
     """
-    flags = sicr_flags(pd_cube, baseline_pd, thresh)
+    flags = sicr_flags(pd_cube, baseline_pd, rule)
     ratio = lifetime_pd(pd_cube, window) / pd_cube
     multiplier = np.where(flags, ratio, 1.0)
 

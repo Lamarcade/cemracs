@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import warnings
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -47,8 +48,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--regions", nargs="+", default=DEFAULT_REGIONS,
                         help="regions to study (default: EU27)")
-    parser.add_argument("--thresh", type=float, default=staging.SICR_THRESHOLD,
-                        help="SICR trigger: migrate when p / p_baseline exceeds this")
+    parser.add_argument("--sicr-rule", choices=sorted(staging.SICR_RULES),
+                        default="ecb",
+                        help="SICR preset: ecb = tripling since origination with the "
+                             "low credit risk exemption and the 20%% absolute backstop, "
+                             "simple = bare doubling, climate = vs the same-date baseline")
+    parser.add_argument("--thresh", type=float, default=None,
+                        help="override the relative multiple")
+    parser.add_argument("--absolute-backstop", type=float, default=None,
+                        help="PD above which SICR triggers on its own (ECB: 0.20)")
+    parser.add_argument("--no-absolute-backstop", action="store_true",
+                        help="drop the absolute backstop")
+    parser.add_argument("--low-risk-floor", type=float, default=None,
+                        help="PD below which the relative trigger does not apply "
+                             "(ECB: 0.003), tested on the initial or the current PD")
+    parser.add_argument("--no-low-risk-exemption", action="store_true",
+                        help="apply the relative trigger at any PD level")
     parser.add_argument("--window", type=float, default=staging.LIFETIME_WINDOW,
                         help="lifetime ECL window in years")
     parser.add_argument("--baseline-scenario", default=sc.BAU_LABEL,
@@ -79,36 +94,88 @@ def main() -> None:
         if "clipping" not in str(w.message):
             print(f"WARNING: {w.message}\n")
 
-    # Stage 1 balance sheet, reused as is: the reference narrative never migrates, so
-    # the cushion and the calibration are the Level 1 ones (see stage2.staging).
-    port = pf.stylised_portfolio(scen.buckets, scen.dates)
-    port = breach.calibrate_cet1_for_ratio(port, scen, cfg, target_ratio=args.target_ratio)
-    ratio0 = breach.cet1_ratio(port, scen, cfg)
+    rule = staging.SICR_RULES[args.sicr_rule]
+    if args.thresh is not None:
+        rule = replace(rule, thresh=args.thresh, name="")
+    if args.no_absolute_backstop:
+        rule = replace(rule, absolute_backstop=None, name="")
+    elif args.absolute_backstop is not None:
+        rule = replace(rule, absolute_backstop=args.absolute_backstop, name="")
+    if args.no_low_risk_exemption:
+        rule = replace(rule, low_risk_floor=None, name="")
+    elif args.low_risk_floor is not None:
+        rule = replace(rule, low_risk_floor=args.low_risk_floor, name="")
 
-    multiplier, flags = staging.provision_multiplier(
-        scen.pd_cube, scen.baseline_pd, thresh=args.thresh, window=args.window
-    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        multiplier, flags = staging.provision_multiplier(
+            scen.pd_cube, scen.baseline_pd, rule=rule, window=args.window
+        )
+    for w in caught:
+        print(f"WARNING: {w.message}\n")
     migration = staging.migration_table(flags, scen.scenarios, scen.dates)
+    ones = np.ones_like(multiplier)
+
+    # Two balance sheets, because they answer different questions and can disagree
+    # sharply once the baseline itself migrates:
+    #   stage1  the bank was capitalised for Stage 1, then staging hit -- the transition
+    #           cost, which can leave the exercise inadmissible
+    #   staged  the bank is capitalised for the accounting it actually applies
+    port = pf.stylised_portfolio(scen.buckets, scen.dates)
+    port_s1 = breach.calibrate_cet1_for_ratio(port, scen, cfg, target_ratio=args.target_ratio)
+    port_s2 = (
+        breach2.calibrate_staged(port, scen, cfg, multiplier, args.target_ratio)
+        if rule.stages_baseline else port_s1
+    )
+    books = [("Stage 1 calibration", port_s1)]
+    if rule.stages_baseline:
+        books.append(("recalibrated on the staged baseline", port_s2))
+
+    ratio0 = breach2.baseline_ratio_staged(port_s2, scen, cfg, multiplier)
 
     print(f"Regions       : {regions}")
     print(f"Buckets       : {scen.n_buckets} (one per sector x region)")
     print(f"Scenarios     : {list(scen.scenarios)}")
     print(f"p0 (reference): {args.baseline_scenario}")
-    print(f"SICR          : p / p_baseline > {args.thresh:g}, re-tested each date")
+    print(f"SICR          : {rule.label}, re-tested each date")
     print(f"Lifetime      : {args.window:g}-year window, last PD held flat past "
           f"{int(scen.dates[-1])}")
     print(f"Clipping      : {clip.summary()}")
-    print(f"CET1 ratio on p0: {np.round(ratio0, 4).tolist()}")
 
     staged = multiplier[flags]
+    lam0 = breach2.baseline_multiplier(scen, multiplier)
     print(f"\nProvision multiplier where triggered: "
           + (f"{staged.min():.2f} to {staged.max():.2f}" if staged.size else "never triggered"))
-    print(f"Baseline narrative multiplier: "
-          f"{multiplier[scen.baseline_index].max():.6f} (must be exactly 1)")
+    print(f"Reference narrative multiplier: max {lam0.max():.3f}, "
+          f"{(lam0 > 1).mean():.0%} of its cells staged"
+          + ("  <- the baseline migrates too, so the cushion is not the Stage 1 one"
+             if rule.stages_baseline else "  (never migrates by construction)"))
+    print(f"CET1_0        : {port_s1.cet1_0 / 1e9:.1f} bn Stage 1 calibration"
+          + (f", {port_s2.cet1_0 / 1e9:.1f} bn recalibrated" if rule.stages_baseline else ""))
+    print(f"Staged baseline CET1 ratio: {np.round(ratio0, 4).tolist()}")
+
+    # what each trigger contributes on its own: the two pull in opposite directions and
+    # the totals alone would not say which one is doing the work
+    if rule.absolute_backstop is not None or rule.low_risk_floor is not None:
+        bare = replace(rule, absolute_backstop=None, low_risk_floor=None, name="")
+        only_relative = staging.sicr_flags(scen.pd_cube, scen.baseline_pd, bare)
+        parts = [f"relative alone {only_relative.mean():.1%}"]
+        if rule.low_risk_floor is not None:
+            kept = staging.sicr_flags(
+                scen.pd_cube, scen.baseline_pd, replace(rule, absolute_backstop=None))
+            parts.append(f"low-risk exemption removes {(only_relative & ~kept).mean():.1%}")
+        if rule.absolute_backstop is not None:
+            backstop = scen.pd_cube > rule.absolute_backstop
+            parts.append(f"20% backstop adds {(backstop & ~only_relative).mean():.1%}")
+        print(f"\nTrigger decomposition: " + ", ".join(parts)
+              + f"  ->  {flags.mean():.1%} in Stage 2")
 
     print("\nShare of buckets in Stage 2 (%):")
     print((migration * 100).round(1).to_string())
 
+    # The relative threshold has to come from the *staged* baseline ratio: built from
+    # the unstaged one it would be compared against a staged path, and the reference
+    # narrative would appear to breach purely from the mismatch.
     if args.r_star_convention == "both":
         configs = cfg.r_star_conventions(current_ratio=float(ratio0.min()))
     elif args.r_star_convention == "absolute":
@@ -124,23 +191,18 @@ def main() -> None:
 
     FIGS_DIR.mkdir(parents=True, exist_ok=True)
     written = []
-    fig = report2.plot_stage_migration(migration, scen, args.thresh, context=context)
+    fig = report2.plot_stage_migration(migration, scen, rule, context=context)
     path = FIGS_DIR / "stage2_migration.png"
     fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     written.append(path)
 
-    ones = np.ones_like(multiplier)
     for candidate in configs:
-        try:
-            breach.cushion(port, scen, candidate, check=True)
-        except ValueError as exc:
-            print(f"\nINADMISSIBLE under {candidate.label}: {exc}")
-            continue
-
-        d1 = breach2.distance_to_breach_staged(port, scen, candidate, ones)
-        d2 = breach2.distance_to_breach_staged(port, scen, candidate, multiplier)
-        check = breach2.check_forms_agree_staged(port, scen, candidate, multiplier)
+      for book_label, book in books:
+        d1 = breach2.distance_to_breach_staged(book, scen, candidate, ones)
+        d2 = breach2.distance_to_breach_staged(book, scen, candidate, multiplier)
+        check = breach2.check_forms_agree_staged(book, scen, candidate, multiplier)
+        h2 = breach2.cushion_staged(book, scen, candidate, multiplier)
 
         table = pd.DataFrame(
             {
@@ -154,7 +216,13 @@ def main() -> None:
             index=pd.Index(scen.scenarios, name="scenario"),
         ).sort_values("stage2_bn")
 
-        print(f"\n=== {candidate.label} ===")
+        print(f"\n=== {candidate.label} — {book_label} ===")
+        if (h2 <= 0).any():
+            print(f"  INADMISSIBLE: staged H[n] <= 0 at "
+                  f"{scen.dates[h2 <= 0].tolist()} (min {h2.min() / 1e9:+.2f} bn). "
+                  "The reference narrative alone is at or below the threshold once its "
+                  "own book is in Stage 2 — read the rows below as a diagnostic, not a "
+                  "reverse stress test.")
         print(table.round(3).to_string())
         flipped = table.index[~table["breach_s1"] & table["breach_s2"]].tolist()
         print(f"  breach set  Stage 1: {table.index[table['breach_s1']].tolist() or 'none'}")
@@ -164,12 +232,15 @@ def main() -> None:
               f"{check['n_staged_cells']} staged cells, "
               f"{check['n_breach_affine']}/{check['n_cells']} cells in breach")
 
-        fig = report2.plot_stage1_vs_stage2(d1, d2, scen, candidate, context=context)
-        tag = candidate.sensitivity.r_star_convention
-        path = FIGS_DIR / f"stage2_distance_{tag}.png"
-        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
-        plt.close(fig)
-        written.append(path)
+        # only the book the run is really about gets a figure, otherwise every
+        # convention would produce two near-identical charts
+        if book is books[-1][1]:
+            fig = report2.plot_stage1_vs_stage2(d1, d2, scen, candidate, context=context)
+            tag = candidate.sensitivity.r_star_convention
+            path = FIGS_DIR / f"stage2_distance_{tag}.png"
+            fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+            plt.close(fig)
+            written.append(path)
 
     print()
     for path in written:

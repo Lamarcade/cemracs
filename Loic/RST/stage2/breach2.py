@@ -9,11 +9,14 @@ carries the per-cell multiplier from :mod:`stage2.staging`.
 IFRS 9 stage a loan sits in, so ``K(p)`` is untouched and the RWA channel is the Stage 1
 one. That is what keeps the change this small.
 
-**The cushion is not redefined here.** The SICR reference is the same-date baseline, so
-the reference narrative compares to itself, never triggers, and carries ``lambda = 1``.
-``H[n]`` is therefore exactly the Stage 1 cushion and :func:`breach.cushion` is called
-unchanged -- as are :func:`breach.calibrate_cet1_for_ratio` and the whole of
-:mod:`portfolio`, :mod:`scenarios` and :mod:`config`.
+**The cushion depends on the SICR reference.** Under ``same_date`` the reference
+narrative compares to itself, never migrates, and ``H[n]`` is exactly the Stage 1
+cushion. Under ``origination`` -- IFRS 9 as written -- the baseline is judged against
+its own origination and migrates like anything else, so the cushion, the calibration
+and the relative ``R_star`` all have to be rebuilt on the staged baseline. That is what
+:func:`cushion_staged`, :func:`calibrate_staged` and :func:`baseline_ratio_staged` are
+for. Everything else is still reused unchanged: :mod:`portfolio`, :mod:`scenarios`,
+:mod:`config` and ``regulatory.capital_charge``.
 
 The breach inequality itself is unaffected in form. Its derivation never assumed the
 provision was a *function* of the current PD, only that it was some amount per unit of
@@ -45,6 +48,119 @@ def psi_staged(
     return provision + 12.5 * cfg.r_star * regulatory.capital_charge(pd_values, cfg.ell)
 
 
+def baseline_multiplier(
+    scenarios: ScenarioSet, multiplier: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """The reference narrative's own row of the multiplier cube, shape ``(n_bucket, n_date)``.
+
+    Identically 1 under the ``same_date`` rule. Under ``origination`` the baseline
+    migrates like any other narrative, and this is what the cushion has to be built on.
+    """
+    return multiplier[scenarios.baseline_index]
+
+
+def cushion_staged(
+    portfolio: Portfolio,
+    scenarios: ScenarioSet,
+    cfg: RstConfig,
+    multiplier: NDArray[np.float64],
+    check: bool = False,
+) -> NDArray[np.float64]:
+    """Reference capital cushion with the baseline's own staging applied.
+
+    ``H[n] = (CET1_RE[n] - R* * RWA_oth) - sum_g E[g,n] * Psi_staged(p0[g,n])``.
+
+    Reduces to :func:`breach.cushion` exactly when the baseline carries a multiplier of
+    1, which is the ``same_date`` case. Under ``origination`` the baseline migrates and
+    the cushion genuinely shrinks -- a bank whose reference path already triples its PD
+    is provisioning on a lifetime basis before any climate increment is applied.
+
+    Raises
+    ------
+    ValueError
+        If ``check`` and the cushion is non-positive somewhere. Left off by default:
+        under ``origination`` an inadmissible cushion is a *result* -- it says the
+        reference narrative alone puts the bank under the threshold -- and the driver
+        reports it rather than aborting.
+    """
+    staged = psi_staged(scenarios.baseline_pd, cfg, baseline_multiplier(scenarios, multiplier))
+    h = (
+        portfolio.cet1_re(cfg)
+        - cfg.r_star * portfolio.rwa_oth
+        - (portfolio.exposure * staged).sum(axis=0)
+    )
+    if check and np.any(h <= 0.0):
+        offending = scenarios.dates[h <= 0.0].tolist()
+        raise ValueError(
+            f"staged H[n] <= 0 at dates {offending} under {cfg.label}: with the baseline "
+            "itself in Stage 2, the reference narrative is already at or below the "
+            "breach level."
+        )
+    return h
+
+
+def calibrate_staged(
+    portfolio: Portfolio,
+    scenarios: ScenarioSet,
+    cfg: RstConfig,
+    multiplier: NDArray[np.float64],
+    target_ratio: float,
+) -> Portfolio:
+    """Pin the **staged** baseline CET1 ratio to ``target_ratio``.
+
+    The counterpart of :func:`breach.calibrate_cet1_for_ratio` once the baseline is
+    itself in Stage 2. Using the Stage 1 calibration instead is a different and equally
+    legitimate question -- "the bank was capitalised for Stage 1, then staging hit" --
+    and the driver reports both, because they answer different things and disagree
+    sharply: on EU27 the Stage 1 calibration leaves the exercise inadmissible under the
+    relative convention, while recalibrating restores it.
+    """
+    if target_ratio <= cfg.r_star:
+        raise ValueError(
+            f"target_ratio={target_ratio} is not above r_star={cfg.r_star}"
+        )
+    lam0 = baseline_multiplier(scenarios, multiplier)
+    provision = (1.0 - cfg.sensitivity.kappa_tax) * (
+        cfg.ell * portfolio.exposure * lam0 * scenarios.baseline_pd
+    ).sum(axis=0)
+    charge = regulatory.capital_charge(scenarios.baseline_pd, cfg.ell)
+    rwa = portfolio.rwa_oth + cfg.regulatory.rwa_factor * (
+        charge * portfolio.exposure
+    ).sum(axis=0)
+
+    return Portfolio(
+        buckets=portfolio.buckets,
+        dates=portfolio.dates,
+        exposure=portfolio.exposure,
+        cet1_0=float((target_ratio * rwa + provision).max()),
+        rwa_oth=portfolio.rwa_oth,
+    )
+
+
+def baseline_ratio_staged(
+    portfolio: Portfolio,
+    scenarios: ScenarioSet,
+    cfg: RstConfig,
+    multiplier: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """CET1 ratio on the reference narrative, with its own staging applied.
+
+    What the relative ``R_star`` convention must be derived from once the baseline can
+    migrate: a threshold built from the *unstaged* baseline would be compared against a
+    staged path, and the reference narrative would appear to breach for no reason other
+    than the mismatch.
+    """
+    lam0 = baseline_multiplier(scenarios, multiplier)
+    provision = (1.0 - cfg.sensitivity.kappa_tax) * (
+        cfg.ell * portfolio.exposure * lam0 * scenarios.baseline_pd
+    ).sum(axis=0)
+    charge = regulatory.capital_charge(scenarios.baseline_pd, cfg.ell)
+    rwa = portfolio.rwa_oth + cfg.regulatory.rwa_factor * (
+        charge * portfolio.exposure
+    ).sum(axis=0)
+    return (portfolio.cet1_re(cfg) - provision) / rwa
+
+
 def erosion_staged(
     portfolio: Portfolio,
     scenarios: ScenarioSet,
@@ -53,11 +169,15 @@ def erosion_staged(
 ) -> NDArray[np.float64]:
     """Climate capital erosion in euros, shape ``(n_scenario, n_date)``.
 
-    ``sum_g E[g,n] * (Psi_staged(p[s,g,n]) - Psi(p0[g,n]))``. The baseline term carries
-    no multiplier: it is Stage 1 by construction.
+    ``sum_g E[g,n] * (Psi_staged(p[s,g,n]) - Psi_staged(p0[g,n]))``. **Both** terms
+    carry their own multiplier: under ``origination`` the baseline is staged too, and
+    measuring a staged scenario against an unstaged reference would count the baseline's
+    own migration as climate erosion.
     """
     staged = psi_staged(scenarios.pd_cube, cfg, multiplier)
-    baseline = regulatory.psi_from_config(scenarios.baseline_pd, cfg)
+    baseline = psi_staged(
+        scenarios.baseline_pd, cfg, baseline_multiplier(scenarios, multiplier)
+    )
     return np.einsum("gn,sgn->sn", portfolio.exposure, staged - baseline[None, :, :])
 
 
@@ -69,7 +189,7 @@ def distance_to_breach_staged(
     check_cushion: bool = False,
 ) -> NDArray[np.float64]:
     """``H[n] - Erosion[s,n]``. Breach is certain where this is negative."""
-    cushion = breach.cushion(portfolio, scenarios, cfg, check=check_cushion)
+    cushion = cushion_staged(portfolio, scenarios, cfg, multiplier, check=check_cushion)
     return cushion[None, :] - erosion_staged(portfolio, scenarios, cfg, multiplier)
 
 
@@ -145,6 +265,9 @@ def check_forms_agree_staged(
         "gn,sgn->sn", portfolio.exposure, charge
     )
     signed = (portfolio.cet1_re(cfg)[None, :] - provision) - cfg.r_star * rwa
+    # (11) and (12) can only agree if the cushion carries the baseline's own staging,
+    # which is the whole point of routing distance_to_breach_staged through
+    # cushion_staged rather than breach.cushion.
 
     affine = distance_to_breach_staged(portfolio, scenarios, cfg, multiplier)
     gap = np.abs(signed - affine)

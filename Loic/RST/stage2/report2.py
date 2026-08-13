@@ -18,6 +18,7 @@ import report
 from config import RstConfig
 from pd import viz_style as vs
 from scenarios import ScenarioSet
+from stage2 import staging
 
 import matplotlib
 
@@ -30,7 +31,7 @@ BILLION = 1e9
 def plot_stage_migration(
     migration: pd.DataFrame,
     scenarios: ScenarioSet,
-    thresh: float,
+    rule: "staging.SicrRule",
     context: report.RunContext | None = None,
 ) -> Figure:
     """Share of buckets sitting in Stage 2, over time, one line per scenario.
@@ -67,8 +68,7 @@ def plot_stage_migration(
     vs.titre(
         ax,
         "When does the book migrate to lifetime ECL?",
-        f"SICR at p / p_baseline > {thresh:g}, re-tested each date so a bucket can cure "
-        "back to Stage 1",
+        f"SICR: {rule.label} — re-tested each date, so a bucket can cure back to Stage 1",
     )
     report._context_strip(fig, context)
     return fig
